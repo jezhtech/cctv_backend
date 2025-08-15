@@ -35,8 +35,8 @@ class User(Base, TimestampMixin, SoftDeleteMixin):
     user_metadata = Column(JSON, nullable=True)  # Store additional user data
     
     # Relationships
-    face_embeddings = relationship("FaceEmbedding", back_populates="user", cascade="all, delete-orphan")
-    attendances = relationship("Attendance", back_populates="user", cascade="all, delete-orphan")
+    face_embeddings = relationship("FaceEmbedding", back_populates="user", cascade="all, delete-orphan", lazy="dynamic")
+    attendances = relationship("Attendance", back_populates="user", cascade="all, delete-orphan", lazy="dynamic")
     
     def __repr__(self):
         return f"<User(id={self.id}, email='{self.email}', name='{self.first_name} {self.last_name}')>"
@@ -104,9 +104,9 @@ class Attendance(Base, TimestampMixin):
     location = Column(String(255), nullable=True)
     
     # Relationships
-    user = relationship("User", back_populates="attendances")
-    camera = relationship("Camera", back_populates="detections")
-    face_embedding = relationship("FaceEmbedding")
+    user = relationship("User", back_populates="attendances", lazy="joined")
+    camera = relationship("Camera", back_populates="attendances", lazy="joined")
+    face_embedding = relationship("FaceEmbedding", lazy="joined")
     
     def __repr__(self):
         return f"<Attendance(id={self.id}, user_id={self.user_id}, check_in='{self.check_in_time}')>"
@@ -137,8 +137,8 @@ class FaceDetection(Base, TimestampMixin):
     full_frame_url = Column(String(500), nullable=True)
     
     # Relationships
-    camera = relationship("Camera", back_populates="detections")
-    recognized_user = relationship("User")
+    camera = relationship("Camera", back_populates="detections", lazy="joined")
+    recognized_user = relationship("User", lazy="joined")
     
     def __repr__(self):
         return f"<FaceDetection(id={self.id}, camera_id={self.camera_id}, timestamp='{self.timestamp}')>"

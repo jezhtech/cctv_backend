@@ -23,9 +23,16 @@ class Settings(BaseSettings):
     DATABASE_POOL_SIZE: int = 20
     DATABASE_MAX_OVERFLOW: int = 30
     DATABASE_POOL_TIMEOUT: int = 30
+    DATABASE_RETRY_COUNT: int = 3
+    DATABASE_RETRY_DELAY: int = 5
+    DATABASE_RETRY_ATTEMPTS: int = 3
     
     # Redis
     REDIS_URL: str = Field(default="redis://localhost:6379/0", description="Redis URL")
+    REDIS_HOST: str = Field(default="localhost", description="Redis host")
+    REDIS_PORT: int = Field(default=6379, description="Redis port")
+    REDIS_DB: int = Field(default=0, description="Redis database number")
+    REDIS_PASSWORD: Optional[str] = Field(default=None, description="Redis password")
     REDIS_POOL_SIZE: int = 10
     
     # Security
@@ -48,7 +55,7 @@ class Settings(BaseSettings):
     
     # Streaming
     STREAM_QUALITY: int = 80
-    STREAM_MAX_FPS: int = 30
+    STREAM_MAX_FPS: int = 60
     STREAM_BUFFER_SIZE: int = 100
     
     # File Storage

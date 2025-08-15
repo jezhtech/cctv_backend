@@ -25,8 +25,20 @@ class CameraService:
     async def create_camera(self, db: Session, camera_data: CameraCreate) -> Camera:
         """Create a new camera."""
         try:
+            # Convert CameraCreate to CameraTestConnection for testing
+            from app.schemas.camera import CameraTestConnection
+            
+            test_data = CameraTestConnection(
+                ip_address=camera_data.ip_address,
+                port=camera_data.port,
+                path=camera_data.path,
+                username=camera_data.username,
+                password=camera_data.password,
+                timeout=30  # Default timeout for testing
+            )
+            
             # Test connection before creating
-            test_result = await self.test_camera_connection(camera_data)
+            test_result = await self.test_camera_connection(test_data)
             if not test_result["success"]:
                 raise ValueError(f"Camera connection test failed: {test_result['message']}")
             
@@ -136,14 +148,8 @@ class CameraService:
         cap = None
         
         try:
-            # Build RTSP URL with credentials if provided
+            # Use the rtsp_url property from CameraTestConnection
             rtsp_url = camera_data.rtsp_url
-            if camera_data.username and camera_data.password:
-                # Insert credentials into RTSP URL
-                if "rtsp://" in rtsp_url:
-                    protocol, rest = rtsp_url.split("://", 1)
-                    host_port, path = rest.split("/", 1)
-                    rtsp_url = f"{protocol}://{camera_data.username}:{camera_data.password}@{host_port}/{path}"
             
             # Open RTSP stream
             cap = cv2.VideoCapture(rtsp_url)
@@ -176,14 +182,13 @@ class CameraService:
             processing_time = (time.time() - start_time) * 1000
             
             if frame_count > 0:
-                frame_rate = frame_count / (time.time() - start_frame_time)
                 return {
                     "success": True,
-                    "message": f"Successfully connected to camera. Processed {frame_count} frames.",
+                    "message": "Camera connection successful",
                     "frame_count": frame_count,
+                    "processing_time_ms": round(processing_time, 2),
                     "resolution": resolution,
-                    "frame_rate": round(frame_rate, 2),
-                    "processing_time_ms": round(processing_time, 2)
+                    "frame_rate": frame_count / (processing_time / 1000) if processing_time > 0 else 0
                 }
             else:
                 return {
@@ -256,7 +261,9 @@ class CameraService:
             
             # Test RTSP connection
             test_data = CameraTestConnection(
-                rtsp_url=camera.rtsp_url,
+                ip_address=camera.ip_address,
+                port=camera.port,
+                path=camera.path,
                 username=camera.username,
                 password=camera.password
             )

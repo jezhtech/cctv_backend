@@ -7,7 +7,7 @@ import uuid
 from app.core.database import get_db
 from app.schemas.camera import (
     CameraCreate, CameraUpdate, CameraResponse, CameraListResponse,
-    CameraHealthCheck, CameraStatistics, CameraTestConnection, CameraTestResponse
+    CameraHealthResponse, CameraStatistics, CameraTestConnection, CameraTestResponse
 )
 from app.services.camera.camera_service import camera_service
 from app.services.streaming.stream_service import stream_manager
@@ -20,6 +20,7 @@ async def create_camera(
     camera_data: CameraCreate,
     db: Session = Depends(get_db)
 ):
+    print(camera_data)
     """Create a new camera."""
     try:
         camera = await camera_service.create_camera(db, camera_data)
@@ -52,7 +53,7 @@ async def get_cameras(
         page = (skip // limit) + 1
         
         return CameraListResponse(
-            cameras=cameras,
+            data=cameras,
             total=total,
             page=page,
             size=len(cameras),
@@ -149,7 +150,7 @@ async def test_camera_connection(
         )
 
 
-@cameras_router.get("/{camera_id}/health", response_model=CameraHealthCheck)
+@cameras_router.get("/{camera_id}/health", response_model=CameraHealthResponse)
 async def get_camera_health(
     camera_id: uuid.UUID,
     db: Session = Depends(get_db)
@@ -162,7 +163,7 @@ async def get_camera_health(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=health["error"]
             )
-        return CameraHealthCheck(**health)
+        return CameraHealthResponse(**health)
     except HTTPException:
         raise
     except Exception as e:

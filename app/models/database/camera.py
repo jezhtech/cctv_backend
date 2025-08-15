@@ -16,8 +16,10 @@ class Camera(Base, TimestampMixin, SoftDeleteMixin):
     name = Column(String(255), nullable=False, index=True)
     description = Column(Text, nullable=True)
     
-    # RTSP Configuration
-    rtsp_url = Column(String(500), nullable=False, unique=True)
+    # Network Configuration
+    ip_address = Column(String(45), nullable=False)  # IPv4/IPv6 address
+    port = Column(Integer, default=554, nullable=False)  # RTSP port
+    path = Column(String(255), nullable=True)  # Optional path (e.g., /h264.sdp)
     username = Column(String(100), nullable=True)
     password = Column(String(255), nullable=True)
     
@@ -29,18 +31,17 @@ class Camera(Base, TimestampMixin, SoftDeleteMixin):
     
     # Location
     location = Column(String(255), nullable=True)
-    latitude = Column(String(20), nullable=True)
-    longitude = Column(String(20), nullable=True)
     
     # Additional Configuration
     settings = Column(JSON, nullable=True)  # Store additional camera-specific settings
     
     # Relationships
-    streams = relationship("CameraStream", back_populates="camera", cascade="all, delete-orphan")
-    detections = relationship("FaceDetection", back_populates="camera", cascade="all, delete-orphan")
+    streams = relationship("CameraStream", back_populates="camera", cascade="all, delete-orphan", lazy="dynamic")
+    detections = relationship("FaceDetection", back_populates="camera", cascade="all, delete-orphan", lazy="dynamic")
+    attendances = relationship("Attendance", back_populates="camera", cascade="all, delete-orphan", lazy="dynamic")
     
     def __repr__(self):
-        return f"<Camera(id={self.id}, name='{self.name}', rtsp_url='{self.rtsp_url}')>"
+        return f"<Camera(id={self.id}, name='{self.name}', ip='{self.ip_address}:{self.port}')>"
     
     @property
     def is_online(self) -> bool:
@@ -51,6 +52,19 @@ class Camera(Base, TimestampMixin, SoftDeleteMixin):
     def current_stream(self):
         """Get current active stream."""
         return next((stream for stream in self.streams if stream.is_active), None)
+    
+    @property
+    def rtsp_url(self) -> str:
+        """Construct RTSP URL from components."""
+        # Handle path properly - avoid double slashes
+        path_part = self.path if self.path else ""
+        if path_part and not path_part.startswith("/"):
+            path_part = "/" + path_part
+        
+        if self.username and self.password:
+            return f"rtsp://{self.username}:{self.password}@{self.ip_address}:{self.port}{path_part}"
+        else:
+            return f"rtsp://{self.ip_address}:{self.port}{path_part}"
 
 
 class CameraStream(Base, TimestampMixin):
@@ -76,7 +90,7 @@ class CameraStream(Base, TimestampMixin):
     memory_usage_mb = Column(Integer, default=0, nullable=False)
     
     # Relationships
-    camera = relationship("Camera", back_populates="streams")
+    camera = relationship("Camera", back_populates="streams", lazy="joined")
     
     def __repr__(self):
         return f"<CameraStream(id={self.id}, camera_id={self.camera_id}, is_active={self.is_active})>"

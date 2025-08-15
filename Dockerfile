@@ -10,7 +10,7 @@ ENV PYTHONUNBUFFERED=1 \
 # Set work directory
 WORKDIR /app
 
-# Install system dependencies
+# Install system dependencies including OpenCV requirements
 RUN apt-get update && apt-get install -y \
     gcc \
     g++ \
@@ -18,11 +18,18 @@ RUN apt-get update && apt-get install -y \
     libjpeg-dev \
     libpng-dev \
     libtiff-dev \
-    libhdf5-dev \
-    libhdf5-serial-dev \
     python3-dev \
     python3-pip \
     python3-venv \
+    # OpenCV dependencies
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    libgomp1 \
+    libgthread-2.0-0 \
+    libgtk-3-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Poetry
@@ -45,6 +52,10 @@ RUN mkdir -p logs uploads models
 
 # Set permissions
 RUN chmod +x start.py
+RUN chmod +x celery_worker.py
+
+# Add the current directory to Python path for Celery
+ENV PYTHONPATH=/app
 
 # Expose port (if needed for the main app)
 EXPOSE 8000

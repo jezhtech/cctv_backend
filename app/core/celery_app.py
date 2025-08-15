@@ -1,5 +1,5 @@
 """Celery configuration for background tasks."""
-from celery import Celery
+from celery import Celery, signals
 from .config import settings
 
 # Create Celery instance
@@ -93,6 +93,19 @@ celery_app.conf.task_annotations = {
         "time_limit": 900,
     },
 }
+
+@signals.worker_process_init.connect
+def init_worker_db(**kwargs):
+    """Re-initialize the DB engine/session after Celery forks a worker."""
+    from app.core.database import dispose_engine, init_engine
+    dispose_engine()
+    init_engine()
+
+@signals.worker_process_shutdown.connect
+def shutdown_worker_db(**kwargs):
+    """Clean up DB connections when a worker shuts down."""
+    from app.core.database import dispose_engine
+    dispose_engine()
 
 if __name__ == "__main__":
     celery_app.start()
