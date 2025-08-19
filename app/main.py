@@ -358,9 +358,11 @@ async def startup_event():
         create_tables()
         logger.info("Database tables created/verified successfully")
         
-        # Initialize face recognition service
-        from app.services.face_recognition.face_service import face_recognition_service
-        logger.info("Face recognition service initialized")
+        
+        # Initialize Redis service
+        from app.services.redis_service import redis_service
+        await redis_service.initialize()
+        logger.info("Redis service initialized")
         
         logger.info(f"{settings.APP_NAME} started successfully")
         
@@ -383,7 +385,12 @@ async def shutdown_event():
         from app.services.streaming.stream_service import stream_manager
         await stream_manager.stop_all_streams()
         
+        # Close Redis connection
+        from app.services.redis_service import redis_service
+        await redis_service.close()
+        
         logger.info("All camera streams stopped")
+        logger.info("Redis connection closed")
         logger.info(f"{settings.APP_NAME} shut down successfully")
         
     except Exception as e:

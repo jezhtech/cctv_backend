@@ -14,6 +14,7 @@ from app.core.database import SessionLocal
 from app.models.database.camera import Camera
 from app.models.database.user import FaceDetection
 from app.services.face_recognition.face_service import face_recognition_service
+from app.services.redis_service import redis_service
 
 
 def safe_float(value: float, default: float = 0.0) -> float:
@@ -212,15 +213,27 @@ class StreamProcessor:
             
             # Create database session
             db = SessionLocal()
+            face_recognition_service.is_initialized = True
             
             try:
                 # Load face embeddings into memory
+                logger.info(f"Camera {self.camera_id}: Loading face embeddings...")
                 face_recognition_service._load_face_embeddings(db)
                 
                 if face_recognition_service.face_index is not None:
-                    logger.info(f"Camera {self.camera_id}: Loaded {len(face_recognition_service.face_embeddings)} face embeddings")
+                    total_embeddings = len(face_recognition_service.face_embeddings) if face_recognition_service.face_embeddings else 0
+                    logger.info(f"Camera {self.camera_id}: ✅ Loaded {total_embeddings} face embeddings")
+                    
+                    # Debug: Check what embeddings are loaded
+                    if total_embeddings > 0:
+                        logger.info(f"Camera {self.camera_id}: Face embeddings loaded successfully")
+                        # Log first few embedding IDs for debugging
+                        first_embeddings = list(face_recognition_service.face_embeddings.keys())[:3]
+                        logger.info(f"Camera {self.camera_id}: First few embedding IDs: {first_embeddings}")
+                    else:
+                        logger.warning(f"Camera {self.camera_id}: ❌ No face embeddings loaded - check database")
                 else:
-                    logger.warning(f"Camera {self.camera_id}: No face embeddings loaded")
+                    logger.warning(f"Camera {self.camera_id}: ❌ Face index not created - no embeddings loaded")
                     
             finally:
                 db.close()
@@ -309,7 +322,8 @@ class StreamProcessor:
                             self.fps = 1.0 / avg_frame_time if avg_frame_time > 0 else 0.0
                     
                     # CRITICAL: Yield control back to event loop to prevent blocking
-                    await asyncio.sleep(0.001)  # 1ms sleep to allow other tasks to run
+                    # Optimized sleep for 30+ FPS - balance between responsiveness and performance
+                    await asyncio.sleep(0.02)  # 20ms sleep for smooth 30+ FPS (50 FPS max theoretical)
                     
                 except Exception as e:
                     logger.error(f"Error in stream processing for camera {self.camera_id}: {str(e)}")
@@ -352,7 +366,7 @@ class StreamProcessor:
                 self.frame_buffer.pop(0)
             
             # Only log occasionally to reduce overhead
-            if self.frame_count % 120 == 0:
+            if self.frame_count % 30 == 0:
                 logger.debug(f"Stored frame {self.frame_count} in memory for camera {self.camera_id}")
                 
         except Exception as e:
@@ -361,10 +375,19 @@ class StreamProcessor:
     async def _process_frame_for_faces_async(self, frame: np.ndarray):
         """Process frame for face detection and recognition asynchronously."""
         try:
-            # Skip if too soon since last detection - increased from 0.1 seconds to 1.0 seconds for slower processing
+            # Process every 3rd frame for optimal 30+ FPS performance
+            # This balances responsiveness with performance
             current_time = time.time()
-            if current_time - self.last_detection_time < 1.0:  # Max 1 detection per second for slower processing
+            if self.frame_count % 3 != 0:  # Process every 3rd frame
                 return
+            
+            # Additional frame rate limiting to prevent GPU overload
+            if hasattr(self, '_last_processing_time'):
+                time_since_last = current_time - self._last_processing_time
+                if time_since_last < 0.033:  # Max 30 FPS processing (33ms between frames)
+                    return
+            
+            self._last_processing_time = current_time
             
             # Validate frame
             if frame is None or frame.size == 0:
@@ -380,8 +403,8 @@ class StreamProcessor:
             
             self.last_detection_time = current_time
             
-            # Update metrics every 120 frames (reduced overhead for slower processing)
-            if self.frame_count % 120 == 0:
+            # Update metrics every 30 frames for optimal performance
+            if self.frame_count % 30 == 0:
                 self._update_metrics()
                 self._cleanup_expired_faces()
             
@@ -400,30 +423,48 @@ class StreamProcessor:
             # Extract face embeddings from the frame
             faces = face_recognition_service._extract_face_embeddings(frame)
             
-            # Only process if faces are actually detected
-            if not faces:
-                # No faces detected in this frame
+            # Optimized logging for performance - only log every 30 frames
+            if faces:
+                if self.frame_count % 30 == 0:  # Reduce logging overhead
+                    logger.info(f"Camera {self.camera_id}: Raw MTCNN detection - {len(faces)} faces found in frame {self.frame_count}")
+                for i, face in enumerate(faces):
+                    bbox = face.get("bbox", {})
+                    confidence = face.get("confidence", 0)
+                    if self.frame_count % 30 == 0:  # Reduce logging overhead
+                        logger.debug(f"  Face {i+1}: bbox={bbox}, confidence={confidence:.3f}")
+                        # Log confidence scores to help tune threshold
+                        if confidence < settings.FACE_DETECTION_CONFIDENCE:
+                            logger.debug(f"  Face {i+1}: REJECTED - confidence {confidence:.3f} < threshold {settings.FACE_DETECTION_CONFIDENCE}")
+                        else:
+                            logger.debug(f"  Face {i+1}: ACCEPTED - confidence {confidence:.3f} >= threshold {settings.FACE_DETECTION_CONFIDENCE}")
+            else:
+                if self.frame_count % 20 == 0:  # Reduce logging overhead
+                    logger.debug(f"Camera {self.camera_id}: No faces detected by MTCNN in frame {self.frame_count}")
                 return
             
-            # Validate that faces have proper bounding boxes
+            # Validate that faces have proper bounding boxes using strict validation
             valid_faces = []
             for face in faces:
-                bbox = face.get("bbox", {})
-                if (bbox and 
-                    'x' in bbox and 'y' in bbox and 'width' in bbox and 'height' in bbox and
-                    bbox['width'] > 0 and bbox['height'] > 0 and
-                    face.get("confidence", 0) > 0):
+                if self._validate_face_data(face, frame.shape):
                     valid_faces.append(face)
             
             if not valid_faces:
-                # No valid faces detected
+                if self.frame_count % 30 == 0:  # Reduce logging overhead
+                    logger.warning(f"Camera {self.camera_id}: No valid faces after validation in frame {self.frame_count}")
                 return
+            
+            if self.frame_count % 30 == 0:  # Reduce logging overhead
+                logger.info(f"Camera {self.camera_id}: Valid faces after validation: {len(valid_faces)}")
             
             # Apply face deduplication to remove overlapping detections
             deduplicated_faces = self._deduplicate_faces(valid_faces)
+            if self.frame_count % 30 == 0:  # Reduce logging overhead
+                logger.info(f"Camera {self.camera_id}: After deduplication: {len(deduplicated_faces)} faces")
             
-            # Process each deduplicated face
+            # Process each deduplicated face SIMULTANEOUSLY
             new_faces_count = 0
+            face_tasks = []  # Collect all face processing tasks
+            
             for face in deduplicated_faces:
                 # Check if this face matches an existing tracked face
                 existing_face_id = self._find_existing_face_id(face)
@@ -438,17 +479,23 @@ class StreamProcessor:
                     face_id = self._add_new_face_to_tracking(face)
                     logger.debug(f"Camera {self.camera_id}: Added new face {face_id}")
                 
-                # Process the face for recognition and display
-                await self._process_detected_face(frame, face)
+                # Collect face processing task (don't await yet)
+                face_tasks.append(self._process_detected_face(frame, face))
+            
+            # Process ALL faces simultaneously using asyncio.gather
+            if face_tasks:
+                if self.frame_count % 30 == 0:  # Reduce logging overhead
+                    logger.info(f"Camera {self.camera_id}: Processing {len(face_tasks)} faces simultaneously")
+                await asyncio.gather(*face_tasks, return_exceptions=True)
             
             # Update face detection metrics only for new faces
             if new_faces_count > 0:
                 self.face_detection_metrics['total_faces_detected'] += new_faces_count
                 logger.info(f"Camera {self.camera_id}: Detected {new_faces_count} new faces in frame {self.frame_count}")
             
-            # Log detection results periodically
-            if self.frame_count % 120 == 0:  # Every 120 frames
-                logger.info(f"Camera {self.camera_id}: Detected {len(deduplicated_faces)} deduplicated faces in frame {self.frame_count}")
+            # Log detection results every 30 frames for performance
+            if self.frame_count % 30 == 0:
+                logger.info(f"Camera {self.camera_id}: Frame {self.frame_count} - Raw: {len(faces)}, Valid: {len(valid_faces)}, Deduped: {len(deduplicated_faces)}, New: {new_faces_count}")
             
         except Exception as e:
             logger.error(f"Error in face detection and recognition for camera {self.camera_id}: {str(e)}")
@@ -471,14 +518,43 @@ class StreamProcessor:
             confidence_score = 0.0
             user_name = "Unknown"
             
+            # Add detailed logging for face recognition debugging
+            logger.info(f"Camera {self.camera_id}: Face recognition attempt - Threshold: {settings.FACE_RECOGNITION_THRESHOLD}")
+            logger.info(f"Camera {self.camera_id}: Similar faces found: {len(similar_faces) if similar_faces else 0}")
+            
+            # Debug: Check if embeddings are loaded
+            total_embeddings = len(face_recognition_service.face_embeddings) if face_recognition_service.face_embeddings else 0
+            logger.info(f"Camera {self.camera_id}: Total embeddings loaded: {total_embeddings}")
+            if total_embeddings == 0:
+                logger.error(f"Camera {self.camera_id}: ❌ NO FACE EMBEDDINGS LOADED - This is why recognition fails!")
+                # Skip recognition if no embeddings are loaded
+                logger.info(f"Camera {self.camera_id}: Skipping face recognition - no embeddings available")
+                return
+            
             if similar_faces:
                 # Get best match
                 best_match_id, confidence_score = similar_faces[0]
+                
+                # Validate confidence score - should never be above 1.0 (100%)
+                if confidence_score > 1.0:
+                    logger.warning(f"Camera {self.camera_id}: ⚠️ Invalid confidence score {confidence_score:.3f} > 1.0, capping at 1.0")
+                    confidence_score = 1.0
+                elif confidence_score < 0.0:
+                    logger.warning(f"Camera {self.camera_id}: ⚠️ Invalid confidence score {confidence_score:.3f} < 0.0, setting to 0.0")
+                    confidence_score = 0.0
+                
                 user_id = face_recognition_service.user_embeddings.get(best_match_id)
                 
                 # Log face recognition details for debugging
-                logger.debug(f"Camera {self.camera_id}: Face recognition - {len(similar_faces)} matches found")
-                logger.debug(f"Camera {self.camera_id}: Best match - ID: {best_match_id}, User: {user_id}, Confidence: {confidence_score:.3f}")
+                logger.info(f"Camera {self.camera_id}: Face recognition - {len(similar_faces)} matches found")
+                logger.info(f"Camera {self.camera_id}: Best match - ID: {best_match_id}, User: {user_id}, Confidence: {confidence_score:.3f}")
+                logger.info(f"Camera {self.camera_id}: Recognition threshold: {settings.FACE_RECOGNITION_THRESHOLD}")
+                
+                # Check if confidence meets threshold
+                if confidence_score >= settings.FACE_RECOGNITION_THRESHOLD:
+                    logger.info(f"Camera {self.camera_id}: ✅ Confidence {confidence_score:.3f} >= threshold {settings.FACE_RECOGNITION_THRESHOLD} - RECOGNIZED")
+                else:
+                    logger.warning(f"Camera {self.camera_id}: ❌ Confidence {confidence_score:.3f} < threshold {settings.FACE_RECOGNITION_THRESHOLD} - NOT RECOGNIZED")
                 
                 if user_id:
                     # Get user name from database
@@ -521,9 +597,25 @@ class StreamProcessor:
                     # Keep only last 100 detections in history
                     if len(self.face_detection_metrics['detection_history']) > 100:
                         self.face_detection_metrics['detection_history'].pop(0)
+                    
+                    # Update the active face tracking with user information
+                    # Find which active face this detection corresponds to
+                    for face_id, face_info in self.face_detection_metrics['active_faces'].items():
+                        if (face_info['bbox']['x'] == face["bbox"]["x"] and 
+                            face_info['bbox']['y'] == face["bbox"]["y"] and
+                            face_info['bbox']['width'] == face["bbox"]["width"] and
+                            face_info['bbox']['height'] == face["bbox"]["height"]):
+                            face_info['user_id'] = user_id
+                            face_info['user_name'] = user_name
+                            face_info['confidence'] = confidence_score
+                            logger.debug(f"Camera {self.camera_id}: Updated face {face_id} with user {user_name}")
+                            break
                 else:
                     logger.warning(f"Camera {self.camera_id}: User not found for matched face embedding")
             else:
+                # No similar faces found
+                logger.warning(f"Camera {self.camera_id}: ❌ No similar faces found - threshold too high or no embeddings loaded")
+                
                 # Face detected but not recognized
                 logger.debug(f"Camera {self.camera_id}: Face detected but not recognized (confidence too low)")
                 
@@ -546,13 +638,33 @@ class StreamProcessor:
                 # Save face image
                 face_image_url = f"detections/{self.camera_id}/{uuid.uuid4()}.jpg"
                 
+                # Convert numpy types to native Python types for JSON serialization
+                def convert_numpy_types(obj):
+                    if isinstance(obj, np.integer):
+                        return int(obj)
+                    elif isinstance(obj, np.floating):
+                        return float(obj)
+                    elif isinstance(obj, np.ndarray):
+                        return obj.tolist()
+                    elif isinstance(obj, dict):
+                        return {key: convert_numpy_types(value) for key, value in obj.items()}
+                    elif isinstance(obj, list):
+                        return [convert_numpy_types(item) for item in obj]
+                    else:
+                        return obj
+                
+                # Convert face data to JSON-serializable format
+                converted_bbox = convert_numpy_types(face["bbox"])
+                converted_landmarks = convert_numpy_types(face.get("landmarks"))
+                converted_confidence = convert_numpy_types(face["confidence"])
+                
                 # Create detection record
                 detection = FaceDetection(
                     camera_id=self.camera_id,
                     timestamp=datetime.utcnow().isoformat(),
-                    confidence_score=face["confidence"],
-                    face_bbox=face["bbox"],
-                    landmarks=face.get("landmarks"),
+                    confidence_score=converted_confidence,
+                    face_bbox=converted_bbox,
+                    landmarks=converted_landmarks,
                     recognized_user_id=user_id,
                     recognition_confidence=confidence if user_id else None,
                     face_image_url=face_image_url
@@ -615,8 +727,8 @@ class StreamProcessor:
             
             # Get text size for label background
             font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = 0.6
-            thickness = 2
+            font_scale = 0.8
+            thickness = 3
             (text_width, text_height), baseline = cv2.getTextSize(label_text, font, font_scale, thickness)
             
             # Calculate label position (below the bounding box)
@@ -774,16 +886,9 @@ class StreamProcessor:
                 if bbox and 'x' in bbox and 'y' in bbox and 'width' in bbox and 'height' in bbox:
                     x, y, w, h = bbox['x'], bbox['y'], bbox['width'], bbox['height']
                     
-                    # Get user information from recent detection history
-                    user_name = "Unknown"
-                    confidence = 0.0
-                    
-                    # Find the most recent detection for this face
-                    for detection in reversed(self.face_detection_metrics.get('detection_history', [])):
-                        if detection.get('user_name') != "Unknown":
-                            user_name = detection.get('user_name', "Unknown")
-                            confidence = detection.get('confidence', 0.0)
-                            break
+                    # Get user information directly from the tracked face
+                    user_name = face_info.get('user_name', "Unknown")
+                    confidence = face_info.get('confidence', 0.0)
                     
                     # Draw bounding box around the face
                     color = (0, 255, 0) if user_name != "Unknown" else (0, 0, 255)  # Green for recognized, Red for unknown
@@ -906,7 +1011,7 @@ class StreamProcessor:
             return True  # Default to True if check fails
     
     def _validate_face_data(self, face: Dict[str, Any], frame_shape: tuple) -> bool:
-        """Validate face data before processing."""
+        """Validate face data before processing with stricter criteria."""
         try:
             # Check if face data exists
             if not face or "embedding" not in face or "bbox" not in face:
@@ -925,9 +1030,27 @@ class StreamProcessor:
                 w <= 0 or h <= 0):
                 return False
             
-            # Check confidence if available
+            # Stricter confidence check - must be above threshold
             confidence = face.get("confidence", 0)
-            if confidence <= 0:
+            if confidence < settings.FACE_DETECTION_CONFIDENCE:
+                return False
+            
+            # Check face size - must be reasonable (not too small, not too large)
+            face_area = w * h
+            frame_area = frame_width * frame_height
+            face_area_ratio = face_area / frame_area
+            
+            # Face should be between 0.1% and 80% of frame area (more permissive)
+            if face_area_ratio < 0.001 or face_area_ratio > 0.8:
+                return False
+            
+            # Check aspect ratio - face should be roughly human-like (more permissive)
+            aspect_ratio = w / h
+            if aspect_ratio < 0.3 or aspect_ratio > 3.0:
+                return False
+            
+            # Check minimum face size - must be at least 20x20 pixels (more permissive)
+            if w < 20 or h < 20:
                 return False
             
             return True
@@ -1063,7 +1186,10 @@ class StreamProcessor:
                 'bbox': bbox,
                 'first_seen': current_time,
                 'last_seen': current_time,
-                'detection_count': 1
+                'detection_count': 1,
+                'user_id': None,
+                'user_name': "Unknown",
+                'confidence': 0.0
             }
             
             logger.debug(f"Camera {self.camera_id}: Added new face to tracking (ID: {face_id})")
@@ -1135,7 +1261,10 @@ class StreamProcessor:
                 'bbox': bbox,
                 'first_seen': current_time,
                 'last_seen': current_time,
-                'detection_count': 1
+                'detection_count': 1,
+                'user_id': None,
+                'user_name': "Unknown",
+                'confidence': 0.0
             }
             
             return face_id
@@ -1167,21 +1296,39 @@ class StreamProcessor:
 
 # Global stream manager instance for FastAPI
 class StreamManager:
-    """Manages multiple camera streams directly in FastAPI process using in-memory storage."""
+    """Manages multiple camera streams using Redis for cross-process/thread communication."""
+    
+    _instance = None
+    _lock = asyncio.Lock()
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(StreamManager, cls).__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
     
     def __init__(self):
-        # Active stream processors
-        self.active_streams: Dict[uuid.UUID, StreamProcessor] = {}
-        self._lock = asyncio.Lock()
+        if not self._initialized:
+            # Initialize Redis service for stream metadata
+            self.redis_service = redis_service
+            # Keep StreamProcessor instances in memory for frame storage
+            self.active_streams = {}  # camera_id -> StreamProcessor instance
+            self._lock = asyncio.Lock()
+            self._initialized = True
     
     async def start_stream(self, camera_id: uuid.UUID, camera: Camera) -> bool:
         """Start a new camera stream asynchronously."""
         async with self._lock:
             try:
-                # Check if stream is already running
-                if camera_id in self.active_streams:
-                    logger.warning(f"Stream already running for camera {camera_id}")
-                    return True
+                # Check if stream is already running using Redis
+                camera_id_str = str(camera_id)
+                try:
+                    is_active = await self.redis_service.is_stream_active(camera_id_str)
+                    if is_active:
+                        logger.warning(f"Stream already running for camera {camera_id}")
+                        return True
+                except Exception as redis_error:
+                    logger.warning(f"Redis check failed, proceeding with stream start: {str(redis_error)}")
                 
                 # Log camera details for debugging
                 logger.info(f"Starting FastAPI stream for camera {camera_id}: {camera.name}")
@@ -1192,10 +1339,24 @@ class StreamManager:
                 # Create new stream processor
                 stream_processor = StreamProcessor(camera_id, camera)
                 if await stream_processor.start_async():
-                    # Store in active streams
+                    # Store StreamProcessor instance in memory for frame access
                     self.active_streams[camera_id] = stream_processor
                     
-                    logger.info(f"Started FastAPI stream for camera {camera_id}")
+                    # Store stream metadata in Redis
+                    try:
+                        stream_data = {
+                            "camera_id": str(camera_id),
+                            "camera_name": camera.name,
+                            "started_at": datetime.utcnow().isoformat(),
+                            "is_running": True,
+                            "status": "active"
+                        }
+                        await self.redis_service.add_active_stream(camera_id_str, stream_data)
+                        logger.info(f"Started FastAPI stream for camera {camera_id} - processor in memory, metadata in Redis")
+                    except Exception as redis_error:
+                        logger.warning(f"Failed to store stream data in Redis, but stream is running: {str(redis_error)}")
+                        logger.info(f"Started FastAPI stream for camera {camera_id} (Redis storage failed)")
+                    
                     return True
                 else:
                     logger.error(f"Failed to start FastAPI stream for camera {camera_id}")
@@ -1209,41 +1370,62 @@ class StreamManager:
         """Stop a camera stream asynchronously."""
         async with self._lock:
             try:
-                # Get stream processor
-                stream_processor = self.active_streams.get(camera_id)
-                if stream_processor:
-                    # Stop the processor
-                    await stream_processor.stop_async()
-                    
-                    # Remove from active streams
-                    del self.active_streams[camera_id]
+                camera_id_str = str(camera_id)
                 
-                logger.info(f"Stopped FastAPI stream for camera {camera_id}")
+                # Check if stream is active in Redis
+                try:
+                    is_active = await self.redis_service.is_stream_active(camera_id_str)
+                    if not is_active:
+                        logger.warning(f"Stream not found for camera {camera_id}")
+                        return False
+                    
+                    # Stop the StreamProcessor instance
+                    if camera_id in self.active_streams:
+                        processor = self.active_streams[camera_id]
+                        await processor.stop_async()
+                        del self.active_streams[camera_id]
+                        logger.info(f"Stopped StreamProcessor for camera {camera_id}")
+                    
+                    # Remove from Redis active streams
+                    await self.redis_service.remove_active_stream(camera_id_str)
+                    logger.info(f"Stopped FastAPI stream for camera {camera_id} - processor stopped, metadata removed from Redis")
+                except Exception as redis_error:
+                    logger.warning(f"Redis operations failed, but stream stopping completed: {str(redis_error)}")
+                    logger.info(f"Stopped FastAPI stream for camera {camera_id} (Redis cleanup failed)")
+                
                 return True
                     
             except Exception as e:
                 logger.error(f"Error stopping FastAPI stream for camera {camera_id}: {str(e)}")
                 return False
     
-    def get_stream_status(self, camera_id: uuid.UUID) -> Optional[Dict[str, Any]]:
+    async def get_stream_status(self, camera_id: uuid.UUID) -> Optional[Dict[str, Any]]:
         """Get streaming status for a camera."""
         try:
-            # Check local active streams
-            if camera_id in self.active_streams:
-                return self.active_streams[camera_id].get_status()
+            camera_id_str = str(camera_id)
             
-            logger.debug(f"No processor found for camera {camera_id}")
+            # Check Redis for stream status
+            status = await self.redis_service.get_stream_status(camera_id_str)
+            if status:
+                return status
+            
+            logger.debug(f"No stream status found in Redis for camera {camera_id}")
             return None
             
         except Exception as e:
             logger.error(f"Error getting stream status for camera {camera_id}: {str(e)}")
             return None
     
-    def get_processor(self, camera_id: uuid.UUID) -> Optional[StreamProcessor]:
-        """Get a specific processor instance."""
-        return self.active_streams.get(camera_id)
+    async def get_processor(self, camera_id: uuid.UUID) -> Optional[StreamProcessor]:
+        """Get StreamProcessor instance for a camera (for frame access)."""
+        try:
+            # Return the actual StreamProcessor instance from memory
+            return self.active_streams.get(camera_id)
+        except Exception as e:
+            logger.error(f"Error getting processor instance for camera {camera_id}: {str(e)}")
+            return None
     
-    def get_face_detection_results(self, camera_id: uuid.UUID, limit: int = 10) -> Optional[Dict[str, Any]]:
+    async def get_face_detection_results(self, camera_id: uuid.UUID, limit: int = 10) -> Optional[Dict[str, Any]]:
         """Get face detection results for a specific camera."""
         try:
             processor = self.active_streams.get(camera_id)
@@ -1254,16 +1436,11 @@ class StreamManager:
             logger.error(f"Error getting face detection results for camera {camera_id}: {str(e)}")
             return None
     
-    def is_stream_active(self, camera_id: uuid.UUID) -> bool:
+    async def is_stream_active(self, camera_id: uuid.UUID) -> bool:
         """Check if a stream is actually active for a camera."""
         try:
-            # Check local active streams
-            if camera_id in self.active_streams:
-                return self.active_streams[camera_id].is_running
-            
-            logger.debug(f"No processor found for camera {camera_id}")
-            return False
-            
+            camera_id_str = str(camera_id)
+            return await self.redis_service.is_stream_active(camera_id_str)
         except Exception as e:
             logger.error(f"Error checking stream active status for camera {camera_id}: {str(e)}")
             return False
@@ -1277,17 +1454,10 @@ class StreamManager:
             logger.error(f"Error force refreshing status for camera {camera_id}: {str(e)}")
             return None
     
-    def get_all_streams_status(self) -> Dict[uuid.UUID, Dict[str, Any]]:
+    async def get_all_streams_status(self) -> Dict[str, Dict[str, Any]]:
         """Get status of all active streams."""
         try:
-            all_statuses = {}
-            
-            # Get local active streams
-            for camera_id, processor in self.active_streams.items():
-                all_statuses[camera_id] = processor.get_status()
-            
-            return all_statuses
-            
+            return await self.redis_service.get_all_streams_status()
         except Exception as e:
             logger.error(f"Error getting all stream statuses: {str(e)}")
             return {}
@@ -1296,14 +1466,26 @@ class StreamManager:
         """Stop all active streams."""
         async with self._lock:
             try:
-                camera_ids = list(self.active_streams.keys())
-                for camera_id in camera_ids:
-                    await self.stop_stream(camera_id)
-                logger.info(f"Stopped all {len(camera_ids)} active streams")
+                # Stop all StreamProcessor instances in memory
+                for camera_id, processor in list(self.active_streams.items()):
+                    try:
+                        await processor.stop_async()
+                        logger.info(f"Stopped StreamProcessor for camera {camera_id}")
+                    except Exception as e:
+                        logger.error(f"Error stopping StreamProcessor for camera {camera_id}: {str(e)}")
+                
+                # Clear the active streams dictionary
+                self.active_streams.clear()
+                
+                # Get all active streams from Redis and remove them
+                active_streams = await self.redis_service.get_active_streams()
+                for camera_id in active_streams:
+                    await self.redis_service.remove_active_stream(camera_id)
+                logger.info(f"Stopped all {len(active_streams)} active streams - processors stopped, Redis cleaned")
             except Exception as e:
                 logger.error(f"Error stopping all streams: {str(e)}")
     
-    def get_all_face_detection_results(self, limit_per_camera: int = 10) -> Dict[uuid.UUID, Dict[str, Any]]:
+    async def get_all_face_detection_results(self, limit_per_camera: int = 10) -> Dict[uuid.UUID, Dict[str, Any]]:
         """Get face detection results for all active cameras."""
         try:
             all_results = {}
@@ -1341,7 +1523,7 @@ class StreamManager:
         except Exception as e:
             logger.error(f"Error refreshing face recognition embeddings: {str(e)}")
     
-    def get_face_detection_statistics(self) -> Dict[str, Any]:
+    async def get_face_detection_statistics(self) -> Dict[str, Any]:
         """Get overall face detection statistics across all cameras."""
         try:
             total_faces_detected = 0

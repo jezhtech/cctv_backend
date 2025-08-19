@@ -94,7 +94,7 @@ async def get_stream_status(camera_id: str):
         camera_uuid = uuid.UUID(camera_id)
         
         # Get stream status
-        stream_status = stream_manager.get_stream_status(camera_uuid)
+        stream_status = await stream_manager.get_stream_status(camera_uuid)
         
         if stream_status:
             return stream_status
@@ -119,7 +119,7 @@ async def get_all_streams_status():
     """Get status of all active streams."""
     try:
         # Get all stream statuses
-        statuses = stream_manager.get_all_streams_status()
+        statuses = await stream_manager.get_all_streams_status()
         
         return {
             "total_streams": len(statuses),
@@ -155,6 +155,45 @@ async def stop_all_streams():
         )
 
 
+@streams_router.get("/health")
+async def get_streams_health():
+    """Get streams and Redis health status."""
+    try:
+        from app.services.redis_service import redis_service
+        
+        # Check Redis health
+        redis_healthy = await redis_service.health_check()
+        
+        # Get stream statuses
+        try:
+            statuses = await stream_manager.get_all_streams_status()
+            streams_healthy = True
+        except Exception as e:
+            logger.error(f"Error getting stream statuses: {str(e)}")
+            statuses = {}
+            streams_healthy = False
+        
+        return {
+            "redis": {
+                "healthy": redis_healthy,
+                "status": "connected" if redis_healthy else "disconnected"
+            },
+            "streams": {
+                "healthy": streams_healthy,
+                "total_streams": len(statuses),
+                "active_streams": len([s for s in statuses.values() if s.get("is_running", False)])
+            },
+            "overall_health": "healthy" if (redis_healthy and streams_healthy) else "degraded"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error checking streams health: {str(e)}")
+        raise HTTPException(
+            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+
 @streams_router.get("/{camera_id}/mjpeg")
 async def get_mjpeg_stream(
     camera_id: str, 
@@ -169,7 +208,7 @@ async def get_mjpeg_stream(
         camera_uuid = uuid.UUID(camera_id)
         
         # Check if stream is active
-        if not stream_manager.is_stream_active(camera_uuid):
+        if not await stream_manager.is_stream_active(camera_uuid):
             raise HTTPException(
                 status_code=http_status.HTTP_404_NOT_FOUND,
                 detail="Stream not found or not active"
@@ -183,7 +222,7 @@ async def get_mjpeg_stream(
             while True:
                 try:
                     # Get latest frame from in-memory storage
-                    processor = stream_manager.get_processor(camera_uuid)
+                    processor = await stream_manager.get_processor(camera_uuid)
                     if processor and processor.is_running:
                         # Get the latest frame from the processor
                         if hasattr(processor, 'latest_frame') and processor.latest_frame is not None:
@@ -240,7 +279,7 @@ async def get_latest_frame(camera_id: str):
         camera_uuid = uuid.UUID(camera_id)
         
         # Get latest frame from in-memory storage
-        processor = stream_manager.get_processor(camera_uuid)
+        processor = await stream_manager.get_processor(camera_uuid)
         if processor and processor.is_running and hasattr(processor, 'latest_frame') and processor.latest_frame is not None:
             # Encode frame as JPEG
             import cv2
@@ -275,7 +314,7 @@ async def get_camera_face_detections(camera_id: str, limit: int = 10):
         camera_uuid = uuid.UUID(camera_id)
         
         # Get face detection results
-        face_detections = stream_manager.get_face_detection_results(camera_uuid, limit)
+        face_detections = await stream_manager.get_face_detection_results(camera_uuid, limit)
         
         if face_detections is not None:
             return face_detections
@@ -300,7 +339,7 @@ async def get_all_face_detections(limit_per_camera: int = 10):
     """Get face detection results for all active cameras."""
     try:
         # Get all face detection results
-        all_detections = stream_manager.get_all_face_detection_results(limit_per_camera)
+        all_detections = await stream_manager.get_all_face_detection_results(limit_per_camera)
         
         return {
             "total_cameras": len(all_detections),
@@ -320,7 +359,7 @@ async def get_face_detection_statistics():
     """Get overall face detection statistics across all cameras."""
     try:
         # Get face detection statistics
-        statistics = stream_manager.get_face_detection_statistics()
+        statistics = await stream_manager.get_face_detection_statistics()
         
         return statistics
         
@@ -361,7 +400,7 @@ async def get_frame_with_bounding_boxes(camera_id: str):
         camera_uuid = uuid.UUID(camera_id)
         
         # Get processor and frame with bounding boxes
-        processor = stream_manager.get_processor(camera_uuid)
+        processor = await stream_manager.get_processor(camera_uuid)
         if processor and processor.is_running:
             frame_with_boxes = processor.get_frame_with_bounding_boxes()
             

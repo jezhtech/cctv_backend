@@ -12,14 +12,15 @@ from datetime import datetime, timedelta
 from app.models.database.camera import Camera, CameraStream
 from app.schemas.camera import CameraCreate, CameraUpdate, CameraTestConnection
 from app.core.celery_app import celery_app
-from app.services.streaming.stream_service import StreamManager
+from app.services.streaming.stream_service import stream_manager
 
 
 class CameraService:
     """Service for managing RTSP cameras."""
     
     def __init__(self):
-        self.stream_manager = StreamManager()
+        # Use the global stream manager instance
+        self.stream_manager = stream_manager
         self.active_streams: Dict[uuid.UUID, Any] = {}
     
     async def create_camera(self, db: Session, camera_data: CameraCreate) -> Camera:

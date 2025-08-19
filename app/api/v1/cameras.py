@@ -270,7 +270,7 @@ async def get_camera_stream_status(
 ):
     """Get camera stream status."""
     try:
-        status_info = stream_manager.get_stream_status(camera_id)
+        status_info = await stream_manager.get_stream_status(camera_id)
         if not status_info:
             return {"message": "No active stream for this camera"}
         return status_info
@@ -285,7 +285,7 @@ async def get_camera_stream_status(
 async def get_all_streams_status():
     """Get status of all active streams."""
     try:
-        return stream_manager.get_all_streams_status()
+        return await stream_manager.get_all_streams_status()
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

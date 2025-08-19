@@ -43,8 +43,8 @@ class Settings(BaseSettings):
     
     # Face Recognition
     FACE_MODEL_PATH: str = "models/arcface.onnx"
-    FACE_DETECTION_CONFIDENCE: float = 0.5
-    FACE_RECOGNITION_THRESHOLD: float = 0.6
+    FACE_DETECTION_CONFIDENCE: float = 0.6
+    FACE_RECOGNITION_THRESHOLD: float = 0.85  # Made much stricter (85%) to prevent false recognition
     MAX_FACES_PER_IMAGE: int = 10
     
     # Camera Settings

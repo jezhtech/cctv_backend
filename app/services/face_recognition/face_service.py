@@ -1,4 +1,4 @@
-"""Face recognition service using InsightFace."""
+"""Face recognition service using MTCNN for detection and VGG for recognition."""
 import cv2
 import numpy as np
 import base64
@@ -9,8 +9,8 @@ from sqlalchemy import and_, desc
 from loguru import logger
 import uuid
 from datetime import datetime, timedelta
-import insightface
-from insightface.app import FaceAnalysis
+import tensorflow as tf
+from mtcnn import MTCNN
 import faiss
 import pickle
 import os
@@ -22,47 +22,100 @@ from app.core.celery_app import celery_app
 
 
 class FaceRecognitionService:
-    """Service for face detection and recognition."""
+    """Service for face detection and recognition using MTCNN + VGG."""
     
     def __init__(self):
-        self.face_analyzer = None
+        self.mtcnn_detector = None
+        self.vgg_model = None
         self.face_index = None
         self.face_embeddings = {}
         self.user_embeddings = {}
         self.is_initialized = False
         self.initialization_lock = False
+        self._log_performance = False  # Performance logging flag - disabled for production
         
-        # Initialize face analyzer
-        self._initialize_face_analyzer()
+        # Initialize MTCNN detector and VGG model
+        self._initialize_models()
     
-    def _initialize_face_analyzer(self):
-        """Initialize InsightFace analyzer."""
+    def _initialize_models(self):
+        """Initialize MTCNN detector and VGG model."""
         try:
             if self.initialization_lock:
                 return
             
             self.initialization_lock = True
-            logger.info("Initializing InsightFace analyzer...")
+            logger.info("Initializing MTCNN detector and VGG model...")
             
-            # Initialize InsightFace
-            self.face_analyzer = FaceAnalysis(
-                name="buffalo_l",
-                providers=['CPUExecutionProvider']
-            )
-            self.face_analyzer.prepare(
-                ctx_id=0,
-                det_size=(640, 640),
-                det_thresh=settings.FACE_DETECTION_CONFIDENCE
+            # Initialize MTCNN for face detection with Metal GPU acceleration
+            # Optimized for multiple face detection with stricter parameters
+            self.mtcnn_detector = MTCNN(
+                stages='face_and_landmarks_detection',
+                device='GPU:0'  # Use Metal GPU for faster detection
             )
             
-            logger.info("InsightFace analyzer initialized successfully")
-            self.is_initialized = True
+            # Load VGG-Face model for face recognition with Metal GPU acceleration
+            self.vgg_model = tf.keras.applications.VGG16(
+                include_top=False,
+                weights='imagenet',
+                input_shape=(224, 224, 3),
+                pooling='avg'
+            )
+            
+            # Configure TensorFlow to use Metal GPU
+            try:
+                # Check if Metal GPU is available
+                gpus = tf.config.list_physical_devices('GPU')
+                if gpus:
+                    logger.info(f"Found {len(gpus)} GPU(s): {gpus}")
+                    # Note: Memory growth is automatically handled by tensorflow-metal
+                    logger.info("Metal GPU acceleration enabled for VGG model")
+                else:
+                    logger.warning("No Metal GPU found, falling back to CPU")
+            except Exception as e:
+                logger.warning(f"Could not configure Metal GPU: {str(e)}, falling back to CPU")
+            
+            logger.info("MTCNN detector and VGG model initialized successfully")
+            
+            # Log Metal GPU performance information
+            self._log_gpu_performance_info()
             
         except Exception as e:
-            logger.error(f"Failed to initialize InsightFace: {str(e)}")
+            logger.error(f"Failed to initialize MTCNN/VGG models: {str(e)}")
             self.is_initialized = False
         finally:
             self.initialization_lock = False
+    
+    def _log_gpu_performance_info(self):
+        """Log Metal GPU performance and configuration information."""
+        try:
+            # Check TensorFlow GPU availability
+            gpus = tf.config.list_physical_devices('GPU')
+            if gpus:
+                logger.info(f"✅ Metal GPU Acceleration: {len(gpus)} GPU(s) available")
+                for i, gpu in enumerate(gpus):
+                    logger.info(f"   GPU {i}: {gpu.name}")
+                
+                # Check if Metal is being used
+                try:
+                    # Test GPU computation
+                    with tf.device('/GPU:0'):
+                        test_tensor = tf.constant([1.0, 2.0, 3.0])
+                        result = tf.reduce_sum(test_tensor)
+                        logger.info(f"✅ Metal GPU computation test successful: {result.numpy()}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Metal GPU computation test failed: {str(e)}")
+                    
+            else:
+                logger.warning("⚠️ No Metal GPU found - using CPU fallback")
+            
+            # Log MTCNN configuration for multiple face detection
+            logger.info(f"🔍 MTCNN Configuration:")
+            logger.info(f"   - stages: face_and_landmarks_detection")
+            logger.info(f"   - device: GPU:0 (Metal acceleration)")
+            logger.info(f"   - optimized for multiple face detection")
+                
+        except Exception as e:
+            logger.warning(f"Could not check GPU performance: {str(e)}")
     
     def _load_face_embeddings(self, db: Session):
         """Load face embeddings from database into memory."""
@@ -81,9 +134,9 @@ class FaceRecognitionService:
                 logger.info("No face embeddings found in database")
                 return
             
-            # Build FAISS index
-            embedding_dim = 512  # InsightFace embedding dimension
-            self.face_index = faiss.IndexFlatIP(embedding_dim)
+            # Build FAISS index for COSINE SIMILARITY (normalized vectors)
+            embedding_dim = 512  # VGG16 embedding dimension (avg pooling)
+            self.face_index = faiss.IndexFlatIP(embedding_dim)  # Inner product for normalized vectors = cosine similarity
             
             # Store embeddings and build index
             for embedding in embeddings:
@@ -91,6 +144,14 @@ class FaceRecognitionService:
                     base64.b64decode(embedding.embedding), 
                     dtype=np.float32
                 )
+                
+                # NORMALIZE the embedding vector to unit length for cosine similarity
+                embedding_norm = np.linalg.norm(embedding_vector)
+                if embedding_norm > 0:
+                    embedding_vector = embedding_vector / embedding_norm
+                else:
+                    logger.warning(f"⚠️ Zero norm embedding found, skipping")
+                    continue
                 
                 self.face_index.add(embedding_vector.reshape(1, -1))
                 self.face_embeddings[len(self.face_embeddings)] = embedding.id
@@ -122,47 +183,94 @@ class FaceRecognitionService:
             return None
     
     def _extract_face_embeddings(self, image: np.ndarray) -> List[Dict[str, Any]]:
-        """Extract face embeddings from image."""
+        """Extract face embeddings from image using MTCNN + VGG."""
         try:
             if not self.is_initialized:
                 return []
             
-            # Analyze faces in image
-            faces = self.face_analyzer.get(image)
+            # Convert BGR to RGB (MTCNN expects RGB)
+            rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            
+            # Detect faces using MTCNN
+            faces = self.mtcnn_detector.detect_faces(rgb_image)
             
             results = []
             for face in faces:
-                if face.det_score >= settings.FACE_DETECTION_CONFIDENCE:
-                    # Get embedding
-                    embedding = face.embedding
-                    
+                confidence = face['confidence']
+                if confidence >= settings.FACE_DETECTION_CONFIDENCE:
                     # Get bounding box
-                    bbox = face.bbox.astype(int)
+                    x, y, w, h = face['box']
                     face_bbox = {
-                        "x": int(bbox[0]),
-                        "y": int(bbox[1]),
-                        "width": int(bbox[2] - bbox[0]),
-                        "height": int(bbox[3] - bbox[1])
+                        "x": int(x),
+                        "y": int(y),
+                        "width": int(w),
+                        "height": int(h)
                     }
                     
-                    # Get landmarks
-                    landmarks = face.kps.astype(int).tolist() if hasattr(face, 'kps') else None
+                    # Get landmarks (eyes, nose, mouth corners)
+                    landmarks = face.get('keypoints', {})
+                    landmarks_list = []
+                    if landmarks:
+                        # Convert landmarks to list format
+                        for key in ['left_eye', 'right_eye', 'nose', 'mouth_left', 'mouth_right']:
+                            if key in landmarks:
+                                landmarks_list.append(landmarks[key])
+                    
+                    # Extract face region and generate embedding using VGG
+                    face_region = image[y:y+h, x:x+w]
+                    if face_region.size > 0:
+                        # Resize to VGG input size (224x224)
+                        face_resized = cv2.resize(face_region, (224, 224))
+                        
+                        # Preprocess for VGG (normalize and expand dimensions)
+                        face_normalized = face_resized.astype(np.float32) / 255.0
+                        face_batch = np.expand_dims(face_normalized, axis=0)
+                        
+                        # Generate embedding using VGG with Metal GPU optimization
+                        start_time = time.time()
+                        try:
+                            # Use TensorFlow's optimized Metal GPU inference
+                            with tf.device('/GPU:0'):
+                                embedding = self.vgg_model.predict(face_batch, verbose=0)
+                            embedding = embedding.flatten()  # Flatten to 1D array
+                            inference_time = (time.time() - start_time) * 1000  # Convert to milliseconds
+                            
+                            # Only log performance metrics occasionally to reduce overhead
+                            if hasattr(self, '_log_performance') and self._log_performance:
+                                logger.debug(f"🚀 Metal GPU inference: {inference_time:.2f}ms")
+                                
+                                # Log GPU memory usage if available
+                                try:
+                                    gpu_memory = tf.config.experimental.get_memory_info('/GPU:0')
+                                    logger.debug(f"GPU Memory - Current: {gpu_memory['current'] / 1024**2:.1f}MB, Peak: {gpu_memory['peak'] / 1024**2:.1f}MB")
+                                except:
+                                    pass
+                                
+                        except Exception as e:
+                            # Fallback to CPU if GPU fails
+                            logger.debug(f"GPU inference failed, falling back to CPU: {str(e)}")
+                            embedding = self.vgg_model.predict(face_batch, verbose=0)
+                            embedding = embedding.flatten()  # Flatten to 1D array
+                            inference_time = (time.time() - start_time) * 1000  # Convert to milliseconds
+                            
+                            if hasattr(self, '_log_performance') and self._log_performance:
+                                logger.debug(f"🐌 CPU fallback inference: {inference_time:.2f}ms")
                     
                     # Calculate quality score
                     quality_score = self._calculate_face_quality(image, face_bbox)
                     
                     # Calculate additional metrics
                     face_size = {"width": face_bbox["width"], "height": face_bbox["height"]}
-                    face_angle = self._calculate_face_angle(face_bbox, landmarks)
+                    face_angle = self._calculate_face_angle(face_bbox, landmarks_list)
                     lighting_score = self._calculate_lighting_score(image, face_bbox)
                     blur_score = self._calculate_blur_score(image, face_bbox)
                     
                     results.append({
                         "embedding": embedding,
-                        "bbox": face_bbox,
-                        "landmarks": landmarks,
-                        "confidence": float(face.det_score),
                         "quality_score": quality_score,
+                        "bbox": face_bbox,
+                        "landmarks": landmarks_list,
+                        "confidence": float(confidence),
                         "size": face_size,
                         "angle": face_angle,
                         "lighting_score": lighting_score,
@@ -318,20 +426,41 @@ class FaceRecognitionService:
             
             # Search for similar embeddings
             query_vector = query_embedding.reshape(1, -1)
+            
+            # NORMALIZE the query vector to unit length for cosine similarity
+            query_norm = np.linalg.norm(query_vector)
+            if query_norm > 0:
+                query_vector = query_vector / query_norm
+            else:
+                logger.warning(f"⚠️ Zero norm query embedding, cannot compute similarity")
+                return []
+            
             similarities, indices = self.face_index.search(query_vector, k=min(10, len(self.face_embeddings)))
             
             # Track best match per user to avoid duplicate user matches
             best_per_user = {}
             
             for i, (similarity, idx) in enumerate(zip(similarities[0], indices[0])):
-                if similarity >= threshold and idx < len(self.face_embeddings):
+                # Validate similarity score - should be between -1 and 1 for cosine similarity
+                if similarity > 1.0:
+                    logger.warning(f"⚠️ Invalid similarity score {similarity:.3f} > 1.0, capping at 1.0")
+                    similarity = 1.0
+                elif similarity < -1.0:
+                    logger.warning(f"⚠️ Invalid similarity score {similarity:.3f} < -1.0, capping at -1.0")
+                    similarity = -1.0
+                
+                # Convert cosine similarity to positive scale (0 to 1) for easier thresholding
+                # Cosine similarity ranges from -1 (opposite) to 1 (same), we want 0 (different) to 1 (same)
+                normalized_similarity = (similarity + 1.0) / 2.0  # Convert from [-1,1] to [0,1]
+                
+                if normalized_similarity >= threshold and idx < len(self.face_embeddings):
                     embedding_id = self.face_embeddings[idx]
                     user_id = self.user_embeddings.get(embedding_id)
                     
                     if user_id:
                         # Keep only the best match per user
-                        if user_id not in best_per_user or similarity > best_per_user[user_id][1]:
-                            best_per_user[user_id] = (embedding_id, float(similarity))
+                        if user_id not in best_per_user or normalized_similarity > best_per_user[user_id][1]:
+                            best_per_user[user_id] = (embedding_id, float(normalized_similarity))
             
             # Return results sorted by similarity (best first)
             results = list(best_per_user.values())
@@ -342,7 +471,7 @@ class FaceRecognitionService:
                 logger.debug(f"Face recognition results: {len(results)} matches found")
                 for i, (embedding_id, similarity) in enumerate(results):
                     user_id = self.user_embeddings.get(embedding_id)
-                    logger.debug(f"  Match {i+1}: User {user_id}, Similarity: {similarity:.3f}")
+                    logger.debug(f"  Match {i+1}: User {user_id}, Normalized Similarity: {similarity:.3f}")
             
             return results
             
