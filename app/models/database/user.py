@@ -27,6 +27,7 @@ class User(Base, TimestampMixin, SoftDeleteMixin):
     
     # Profile
     avatar_url = Column(String(500), nullable=True)
+    profile_images = Column(JSON, nullable=True)  # Array of profile image URLs
     department = Column(String(100), nullable=True)
     employee_id = Column(String(50), nullable=True, unique=True)
     position = Column(String(100), nullable=True)
@@ -49,7 +50,32 @@ class User(Base, TimestampMixin, SoftDeleteMixin):
     @property
     def has_face_data(self) -> bool:
         """Check if user has face embeddings."""
-        return len(self.face_embeddings) > 0
+        try:
+            return self.face_embeddings.count() > 0
+        except:
+            return False
+    
+    @property
+    def profile_images_list(self) -> list:
+        """Get profile images as a list."""
+        try:
+            if self.profile_images:
+                if isinstance(self.profile_images, list):
+                    return self.profile_images
+                elif isinstance(self.profile_images, str):
+                    # Handle case where it might be stored as a JSON string
+                    import json
+                    try:
+                        return json.loads(self.profile_images)
+                    except:
+                        return []
+                else:
+                    return []
+            return []
+        except Exception as e:
+            # Log error and return empty list
+            print(f"Error getting profile_images_list: {e}")
+            return []
 
 
 class FaceEmbedding(Base, TimestampMixin):

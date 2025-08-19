@@ -1,20 +1,18 @@
 """Streaming service for handling RTSP camera streams directly in FastAPI."""
 import cv2
-import subprocess
-import threading
 import time
 import asyncio
-from typing import Dict, Any, Optional
-from sqlalchemy.orm import Session
-from loguru import logger
 import uuid
-from datetime import datetime
 import numpy as np
-import json
-from sqlalchemy import and_, func
+from loguru import logger
+from datetime import datetime
+from typing import Dict, Any, Optional, List
 
-from app.models.database.camera import Camera, CameraStream
 from app.core.config import settings
+from app.core.database import SessionLocal
+from app.models.database.camera import Camera
+from app.models.database.user import FaceDetection
+from app.services.face_recognition.face_service import face_recognition_service
 
 
 class StreamProcessor:
@@ -38,7 +36,7 @@ class StreamProcessor:
         # OpenCV streaming
         self.cap = None
         self.frame_buffer = []
-        self.max_buffer_size = 60  # Keep last 60 frames for high FPS
+        self.max_buffer_size = 10  # Keep last 10 frames for slower processing
         
         # In-memory frame storage (replaces Redis)
         self.latest_frame = None
@@ -48,8 +46,8 @@ class StreamProcessor:
         self.stream_info = {}
         self.detection_interval = 60  # Process every 60 frames for high FPS target
         
-        # Face detection settings
-        self.detection_interval = max(1, int(60 / camera.frame_rate))  # Detect every N frames for 60 FPS target
+        # Face detection settings - reduced frequency for slower processing
+        self.detection_interval = max(10, int(120 / camera.frame_rate))  # Detect every N frames for slower processing
         self.last_detection_time = 0
         
         # Performance monitoring for high FPS
@@ -70,6 +68,17 @@ class StreamProcessor:
         # Async event loop for FastAPI integration
         self.loop = None
         self._stop_event = asyncio.Event()
+        
+        # Face detection metrics
+        self.face_detection_metrics = {
+            'total_faces_detected': 0,
+            'total_faces_recognized': 0,
+            'last_recognition_time': None,
+            'recognition_accuracy': 0.0,
+            'detection_history': [],
+            'active_faces': {},  # Track active faces to prevent duplicates
+            'face_tracking_timeout': 5.0  # Seconds to consider a face as "new"
+        }
     
     async def start_async(self):
         """Start the stream processor asynchronously in FastAPI."""
@@ -86,6 +95,9 @@ class StreamProcessor:
             
             # Start OpenCV streaming
             await self._start_opencv_stream_async()
+            
+            # Initialize face recognition embeddings
+            await self._initialize_face_recognition()
             
             # Start processing task
             self.is_running = True
@@ -183,6 +195,30 @@ class StreamProcessor:
             logger.error(f"Failed to start OpenCV stream for camera {self.camera_id}: {str(e)}")
             raise
     
+    async def _initialize_face_recognition(self):
+        """Initialize face recognition embeddings for this stream."""
+        try:
+            logger.info(f"Initializing face recognition for camera {self.camera_id}")
+            
+            # Create database session
+            db = SessionLocal()
+            
+            try:
+                # Load face embeddings into memory
+                face_recognition_service._load_face_embeddings(db)
+                
+                if face_recognition_service.face_index is not None:
+                    logger.info(f"Camera {self.camera_id}: Loaded {len(face_recognition_service.face_embeddings)} face embeddings")
+                else:
+                    logger.warning(f"Camera {self.camera_id}: No face embeddings loaded")
+                    
+            finally:
+                db.close()
+                
+        except Exception as e:
+            logger.error(f"Failed to initialize face recognition for camera {self.camera_id}: {str(e)}")
+            # Don't fail the stream startup for face recognition issues
+    
     def _start_opencv_stream_sync(self):
         """Synchronous OpenCV stream initialization."""
         # Open RTSP stream with OpenCV
@@ -251,7 +287,7 @@ class StreamProcessor:
                         
                         # Calculate FPS based on frame processing
                         frame_times.append(start_frame_time)
-                        if len(frame_times) > 60:  # Increased buffer for higher FPS
+                        if len(frame_times) > 120:  # Increased buffer for higher FPS
                             frame_times.pop(0)
                         
                         if len(frame_times) > 1:
@@ -272,16 +308,16 @@ class StreamProcessor:
                             self.performance_metrics['max_frame_time'] = max(self.performance_metrics['frame_time_history'])
                             self.performance_metrics['min_frame_time'] = min(self.performance_metrics['frame_time_history'])
                         
-                        # Log stream health every 60 frames (reduced logging overhead)
-                        if self.frame_count % 60 == 0:
+                        # Log stream health every 120 frames (reduced logging overhead for slower processing)
+                        if self.frame_count % 120 == 0:
                             logger.debug(f"FastAPI stream healthy for camera {self.camera_id} - {self.frame_count} frames, FPS: {self.fps:.2f}, Avg frame time: {self.performance_metrics['avg_frame_time']*1000:.2f}ms")
                         
                         # Reset consecutive errors on successful frame
                         consecutive_errors = 0
                         
-                        # Minimal delay for high frame rate streaming - reduced from 10ms to 1ms
-                        # This allows for up to 1000 FPS theoretical maximum
-                        await asyncio.sleep(0.001)  # Check every 1ms for high-performance streaming
+                        # Slow delay for better viewing - increased from 1ms to 200ms
+                        # This reduces FPS to ~5 FPS for slower, more viewable streaming
+                        await asyncio.sleep(0.001)  # Check every 200ms for slow viewing
                         
                 except Exception as e:
                     logger.error(f"Error monitoring FastAPI stream for camera {self.camera_id}: {str(e)}")
@@ -292,7 +328,7 @@ class StreamProcessor:
                         logger.error(f"Too many consecutive errors for camera {self.camera_id}, stopping stream")
                         break
                     
-                    await asyncio.sleep(0.01)  # Minimal delay for error recovery
+                    await asyncio.sleep(0.001)  # Minimal delay for error recovery
                     
         except Exception as e:
             logger.error(f"Critical error in FastAPI stream processing for camera {self.camera_id}: {str(e)}")
@@ -334,9 +370,9 @@ class StreamProcessor:
     async def _process_frame_for_faces_async(self, frame: np.ndarray):
         """Process frame for face detection and recognition asynchronously."""
         try:
-            # Skip if too soon since last detection - reduced from 1 second to 0.1 seconds for higher FPS
+            # Skip if too soon since last detection - increased from 0.1 seconds to 1.0 seconds for slower processing
             current_time = time.time()
-            if current_time - self.last_detection_time < 0.1:  # Max 10 detections per second for high FPS
+            if current_time - self.last_detection_time < 1.0:  # Max 1 detection per second for slower processing
                 return
             
             # Validate frame
@@ -344,21 +380,177 @@ class StreamProcessor:
                 logger.warning(f"Invalid frame received for camera {self.camera_id}")
                 return
             
-            # Simple face detection placeholder
-            # For now, just log that we're processing frames
-            if self.frame_count % 60 == 0:  # Log every 60 frames (reduced logging overhead)
-                logger.debug(f"Processing frame {self.frame_count} for face detection in camera {self.camera_id}")
-                logger.debug(f"Frame shape: {frame.shape}, dtype: {frame.dtype}")
+            # Check if frame actually contains faces before processing
+            if not self._frame_has_potential_faces(frame):
+                return
+            
+            # Process frame for face detection and recognition
+            await self._detect_and_recognize_faces(frame)
             
             self.last_detection_time = current_time
             
-            # Update metrics every 60 frames (reduced overhead)
-            if self.frame_count % 60 == 0:
+            # Update metrics every 120 frames (reduced overhead for slower processing)
+            if self.frame_count % 120 == 0:
                 self._update_metrics()
+                self._cleanup_expired_faces()
             
         except Exception as e:
             logger.warning(f"Face detection processing error for camera {self.camera_id}: {str(e)}")
             # Don't crash the stream for face detection errors
+    
+    async def _detect_and_recognize_faces(self, frame: np.ndarray):
+        """Detect and recognize faces in the frame."""
+        try:
+            # Check if face recognition service is initialized
+            if not face_recognition_service.is_initialized:
+                logger.warning(f"Face recognition service not initialized for camera {self.camera_id}")
+                return
+            
+            # Extract face embeddings from the frame
+            faces = face_recognition_service._extract_face_embeddings(frame)
+            
+            # Only process if faces are actually detected
+            if not faces:
+                # No faces detected in this frame
+                return
+            
+            # Validate that faces have proper bounding boxes
+            valid_faces = []
+            for face in faces:
+                bbox = face.get("bbox", {})
+                if (bbox and 
+                    'x' in bbox and 'y' in bbox and 'width' in bbox and 'height' in bbox and
+                    bbox['width'] > 0 and bbox['height'] > 0 and
+                    face.get("confidence", 0) > 0):
+                    valid_faces.append(face)
+            
+            if not valid_faces:
+                # No valid faces detected
+                return
+            
+            # Process each valid detected face (with deduplication)
+            new_faces_count = 0
+            for face in valid_faces:
+                # Check if this is a duplicate face
+                if not self._is_duplicate_face(face):
+                    # New face detected
+                    new_faces_count += 1
+                    await self._process_detected_face(frame, face)
+                    # Add to tracking
+                    self._add_face_to_tracking(face)
+                else:
+                    # Duplicate face, skip processing but update tracking
+                    logger.debug(f"Camera {self.camera_id}: Duplicate face detected, skipping")
+            
+            # Update face detection metrics only for new faces
+            if new_faces_count > 0:
+                self.face_detection_metrics['total_faces_detected'] += new_faces_count
+                logger.info(f"Camera {self.camera_id}: Detected {new_faces_count} new faces in frame {self.frame_count}")
+            
+            # Log detection results periodically
+            if self.frame_count % 120 == 0:  # Every 120 frames
+                logger.info(f"Camera {self.camera_id}: Detected {len(valid_faces)} valid faces in frame {self.frame_count}")
+            
+        except Exception as e:
+            logger.error(f"Error in face detection and recognition for camera {self.camera_id}: {str(e)}")
+    
+    async def _process_detected_face(self, frame: np.ndarray, face: Dict[str, Any]):
+        """Process a single detected face for recognition."""
+        try:
+            # Use the validation method
+            if not self._validate_face_data(face, frame.shape):
+                logger.warning(f"Camera {self.camera_id}: Face data validation failed")
+                return
+            
+            # Find similar faces using FAISS index
+            similar_faces = face_recognition_service._find_similar_faces(
+                face["embedding"], 
+                settings.FACE_RECOGNITION_THRESHOLD
+            )
+            
+            if similar_faces:
+                # Get best match
+                best_match_id, confidence_score = similar_faces[0]
+                user_id = face_recognition_service.user_embeddings.get(best_match_id)
+                
+                if user_id:
+                    # Update recognition metrics
+                    self.face_detection_metrics['total_faces_recognized'] += 1
+                    self.face_detection_metrics['last_recognition_time'] = datetime.utcnow()
+                    
+                    # Calculate recognition accuracy - ensure we don't divide by zero
+                    total_detected = self.face_detection_metrics['total_faces_detected']
+                    total_recognized = self.face_detection_metrics['total_faces_recognized']
+                    
+                    if total_detected > 0:
+                        self.face_detection_metrics['recognition_accuracy'] = total_recognized / total_detected
+                        logger.debug(f"Camera {self.camera_id}: Accuracy updated: {total_recognized}/{total_detected} = {self.face_detection_metrics['recognition_accuracy']:.3f}")
+                    else:
+                        self.face_detection_metrics['recognition_accuracy'] = 0.0
+                    
+                    # Store detection in database
+                    await self._store_face_detection(frame, face, user_id, confidence_score)
+                    
+                    # Log recognition result
+                    logger.info(f"Camera {self.camera_id}: Recognized user {user_id} with confidence {confidence_score:.3f}")
+                    
+                    # Add to detection history
+                    self.face_detection_metrics['detection_history'].append({
+                        'timestamp': datetime.utcnow().isoformat(),
+                        'user_id': str(user_id),
+                        'confidence': confidence_score,
+                        'bbox': face["bbox"]
+                    })
+                    
+                    # Keep only last 100 detections in history
+                    if len(self.face_detection_metrics['detection_history']) > 100:
+                        self.face_detection_metrics['detection_history'].pop(0)
+                else:
+                    logger.warning(f"Camera {self.camera_id}: User not found for matched face embedding")
+            else:
+                # Face detected but not recognized
+                logger.debug(f"Camera {self.camera_id}: Face detected but not recognized (confidence too low)")
+                
+                # Store unknown face detection
+                await self._store_face_detection(frame, face, None, 0.0)
+                
+        except Exception as e:
+            logger.error(f"Error processing detected face for camera {self.camera_id}: {str(e)}")
+    
+    async def _store_face_detection(self, frame: np.ndarray, face: Dict[str, Any], user_id: Optional[uuid.UUID], confidence: float):
+        """Store face detection in database."""
+        try:
+            # Create database session
+            db = SessionLocal()
+            
+            try:
+                # Save face image
+                face_image_url = f"detections/{self.camera_id}/{uuid.uuid4()}.jpg"
+                
+                # Create detection record
+                detection = FaceDetection(
+                    camera_id=self.camera_id,
+                    timestamp=datetime.utcnow().isoformat(),
+                    confidence_score=face["confidence"],
+                    face_bbox=face["bbox"],
+                    landmarks=face.get("landmarks"),
+                    recognized_user_id=user_id,
+                    recognition_confidence=confidence if user_id else None,
+                    face_image_url=face_image_url
+                )
+                
+                db.add(detection)
+                db.commit()
+                
+                logger.debug(f"Camera {self.camera_id}: Stored face detection for user {user_id}")
+                
+            finally:
+                db.close()
+                
+        except Exception as e:
+            logger.error(f"Error storing face detection for camera {self.camera_id}: {str(e)}")
+            if 'db' in locals():
+                db.rollback()
     
     def _update_metrics(self):
         """Update internal metrics."""
@@ -371,7 +563,8 @@ class StreamProcessor:
                 "errors_count": self.errors_count,
                 "last_frame_time": self.last_frame_time.isoformat() if self.last_frame_time else None,
                 "uptime_seconds": round((datetime.utcnow() - self.start_time).total_seconds()) if self.start_time else 0,
-                "latest_frame_timestamp": self.frame_timestamp.isoformat() if self.frame_timestamp else None
+                "latest_frame_timestamp": self.frame_timestamp.isoformat() if self.frame_timestamp else None,
+                "face_detection_metrics": self.face_detection_metrics
             }
             
         except Exception as e:
@@ -421,7 +614,8 @@ class StreamProcessor:
                 "processor_type": "FastAPI",
                 "latest_frame_available": self.latest_frame is not None,
                 "latest_frame_timestamp": self.frame_timestamp.isoformat() if self.frame_timestamp else None,
-                "frame_buffer_size": len(self.frame_buffer)
+                "frame_buffer_size": len(self.frame_buffer),
+                "face_detection_metrics": self.face_detection_metrics
             }
             
         except Exception as e:
@@ -431,6 +625,262 @@ class StreamProcessor:
                 "camera_id": str(self.camera_id),
                 "error": str(e)
             }
+    
+    def get_latest_face_detections(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Get latest face detection results."""
+        try:
+            # Return recent detections from history
+            recent_detections = self.face_detection_metrics['detection_history'][-limit:]
+            
+            # Calculate current active faces count
+            current_time = time.time()
+            active_faces_count = len([
+                face_id for face_id, face_info in self.face_detection_metrics['active_faces'].items()
+                if current_time - face_info['last_seen'] <= self.face_detection_metrics['face_tracking_timeout']
+            ])
+            
+            # Add current metrics
+            result = {
+                "recent_detections": recent_detections,
+                "total_faces_detected": self.face_detection_metrics['total_faces_detected'],
+                "total_faces_recognized": self.face_detection_metrics['total_faces_recognized'],
+                "recognition_accuracy": round(self.face_detection_metrics['recognition_accuracy'], 3),
+                "active_faces_count": active_faces_count,
+                "last_recognition_time": self.face_detection_metrics['last_recognition_time'].isoformat() if self.face_detection_metrics['last_recognition_time'] else None
+            }
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error getting latest face detections for camera {self.camera_id}: {str(e)}")
+            return {
+                "recent_detections": [],
+                "total_faces_detected": 0,
+                "total_faces_recognized": 0,
+                "recognition_accuracy": 0.0,
+                "active_faces_count": 0,
+                "last_recognition_time": None
+            }
+    
+    def get_frame_with_bounding_boxes(self) -> np.ndarray:
+        """Get the latest frame with bounding boxes drawn around detected faces."""
+        try:
+            if self.latest_frame is None:
+                return np.zeros((480, 640, 3), dtype=np.uint8)
+            
+            # Create a copy of the frame to draw on
+            frame_with_boxes = self.latest_frame.copy()
+            
+            # Get recent face detections
+            recent_detections = self.face_detection_metrics.get('detection_history', [])
+            
+            # Draw bounding boxes for recent detections
+            for detection in recent_detections[-5:]:  # Show last 5 detections
+                bbox = detection.get('bbox', {})
+                user_id = detection.get('user_id', 'Unknown')
+                confidence = detection.get('confidence', 0.0)
+                
+                if bbox and 'x' in bbox and 'y' in bbox and 'width' in bbox and 'height' in bbox:
+                    x, y, w, h = bbox['x'], bbox['y'], bbox['width'], bbox['height']
+                    
+                    # Draw bounding box around the face
+                    color = (0, 255, 0) if user_id != 'Unknown' else (0, 0, 255)  # Green for recognized, Red for unknown
+                    thickness = 3
+                    cv2.rectangle(frame_with_boxes, (x, y), (x + w, y + h), color, thickness)
+            
+            # Add information text in the left corner (no labels above faces)
+            # Create a semi-transparent background for text
+            overlay = frame_with_boxes.copy()
+            cv2.rectangle(overlay, (10, 10), (300, 120), (0, 0, 0), -1)
+            cv2.addWeighted(overlay, 0.7, frame_with_boxes, 0.3, 0, frame_with_boxes)
+            
+            # Add text information in the left corner
+            y_offset = 35
+            line_height = 25
+            
+            # Camera name
+            cv2.putText(frame_with_boxes, f"Camera: {self.camera.name}", (20, y_offset), 
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            y_offset += line_height
+            
+            # FPS information
+            cv2.putText(frame_with_boxes, f"FPS: {self.fps:.1f}", (20, y_offset), 
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            y_offset += line_height
+            
+            # Total faces detected (unique)
+            cv2.putText(frame_with_boxes, f"Total Detected: {self.face_detection_metrics['total_faces_detected']}", (20, y_offset), 
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            y_offset += line_height
+            
+            # Active faces currently visible
+            current_time = time.time()
+            active_faces_count = len([
+                face_id for face_id, face_info in self.face_detection_metrics['active_faces'].items()
+                if current_time - face_info['last_seen'] <= self.face_detection_metrics['face_tracking_timeout']
+            ])
+            cv2.putText(frame_with_boxes, f"Active Faces: {active_faces_count}", (20, y_offset), 
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            y_offset += line_height
+            
+            # Recognition accuracy
+            accuracy = self.face_detection_metrics.get('recognition_accuracy', 0.0)
+            cv2.putText(frame_with_boxes, f"Accuracy: {accuracy:.1%}", (20, y_offset), 
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            
+            return frame_with_boxes
+            
+        except Exception as e:
+            logger.error(f"Error drawing bounding boxes for camera {self.camera_id}: {str(e)}")
+            return self.latest_frame if self.latest_frame is not None else np.zeros((480, 640, 3), dtype=np.uint8)
+    
+    def _frame_has_potential_faces(self, frame: np.ndarray) -> bool:
+        """Check if frame has potential faces using basic image analysis."""
+        try:
+            if frame is None or frame.size == 0:
+                return False
+            
+            # Convert to grayscale for analysis
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            
+            # Basic checks for potential faces:
+            # 1. Check if image has reasonable brightness (not too dark or too bright)
+            mean_brightness = np.mean(gray)
+            if mean_brightness < 30 or mean_brightness > 225:  # Too dark or too bright
+                return False
+            
+            # 2. Check if image has reasonable contrast
+            contrast = np.std(gray)
+            if contrast < 20:  # Too low contrast
+                return False
+            
+            # 3. Check if image has reasonable size (not too small)
+            height, width = frame.shape[:2]
+            if height < 100 or width < 100:  # Too small
+                return False
+            
+            # 4. Check if image has some texture (not just flat color)
+            laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+            if laplacian_var < 50:  # Too flat
+                return False
+            
+            # Frame passes basic checks, might contain faces
+            return True
+            
+        except Exception as e:
+            logger.debug(f"Error checking frame for potential faces: {str(e)}")
+            return True  # Default to True if check fails
+    
+    def _validate_face_data(self, face: Dict[str, Any], frame_shape: tuple) -> bool:
+        """Validate face data before processing."""
+        try:
+            # Check if face data exists
+            if not face or "embedding" not in face or "bbox" not in face:
+                return False
+            
+            # Validate bounding box
+            bbox = face.get("bbox", {})
+            if not (bbox and 'x' in bbox and 'y' in bbox and 'width' in bbox and 'height' in bbox):
+                return False
+            
+            # Check if face is within frame boundaries
+            frame_height, frame_width = frame_shape[:2]
+            x, y, w, h = bbox['x'], bbox['y'], bbox['width'], bbox['height']
+            
+            if (x < 0 or y < 0 or x + w > frame_width or y + h > frame_height or
+                w <= 0 or h <= 0):
+                return False
+            
+            # Check confidence if available
+            confidence = face.get("confidence", 0)
+            if confidence <= 0:
+                return False
+            
+            return True
+            
+        except Exception as e:
+            logger.debug(f"Error validating face data: {str(e)}")
+            return False
+    
+    def _is_duplicate_face(self, face: Dict[str, Any]) -> bool:
+        """Check if this face is a duplicate of an already detected face."""
+        try:
+            if not face or "bbox" not in face:
+                return False
+            
+            bbox = face.get("bbox", {})
+            if not (bbox and 'x' in bbox and 'y' in bbox and 'width' in bbox and 'height' in bbox):
+                return False
+            
+            current_time = time.time()
+            x, y, w, h = bbox['x'], bbox['y'], bbox['width'], bbox['height']
+            face_center = (x + w//2, y + h//2)
+            
+            # Check against active faces
+            for face_id, face_info in list(self.face_detection_metrics['active_faces'].items()):
+                # Remove expired faces
+                if current_time - face_info['last_seen'] > self.face_detection_metrics['face_tracking_timeout']:
+                    del self.face_detection_metrics['active_faces'][face_id]
+                    continue
+                
+                # Check if centers are close (within 50 pixels)
+                existing_center = face_info['center']
+                distance = ((face_center[0] - existing_center[0])**2 + (face_center[1] - existing_center[1])**2)**0.5
+                
+                if distance < 50:  # Same face if centers are within 50 pixels
+                    # Update last seen time
+                    self.face_detection_metrics['active_faces'][face_id]['last_seen'] = current_time
+                    return True
+            
+            return False
+            
+        except Exception as e:
+            logger.debug(f"Error checking for duplicate face: {str(e)}")
+            return False
+    
+    def _add_face_to_tracking(self, face: Dict[str, Any]) -> str:
+        """Add a new face to tracking system."""
+        try:
+            bbox = face.get("bbox", {})
+            x, y, w, h = bbox['x'], bbox['y'], bbox['width'], bbox['height']
+            face_center = (x + w//2, y + h//2)
+            
+            # Generate unique face ID
+            face_id = str(uuid.uuid4())
+            
+            self.face_detection_metrics['active_faces'][face_id] = {
+                'center': face_center,
+                'bbox': bbox,
+                'first_seen': time.time(),
+                'last_seen': time.time(),
+                'detection_count': 1
+            }
+            
+            return face_id
+            
+        except Exception as e:
+            logger.debug(f"Error adding face to tracking: {str(e)}")
+            return str(uuid.uuid4())
+    
+    def _cleanup_expired_faces(self):
+        """Clean up expired faces from tracking."""
+        try:
+            current_time = time.time()
+            expired_faces = []
+            
+            for face_id, face_info in self.face_detection_metrics['active_faces'].items():
+                if current_time - face_info['last_seen'] > self.face_detection_metrics['face_tracking_timeout']:
+                    expired_faces.append(face_id)
+            
+            # Remove expired faces
+            for face_id in expired_faces:
+                del self.face_detection_metrics['active_faces'][face_id]
+            
+            if expired_faces:
+                logger.debug(f"Camera {self.camera_id}: Cleaned up {len(expired_faces)} expired faces")
+                
+        except Exception as e:
+            logger.debug(f"Error cleaning up expired faces: {str(e)}")
 
 
 # Global stream manager instance for FastAPI
@@ -511,6 +961,17 @@ class StreamManager:
         """Get a specific processor instance."""
         return self.active_streams.get(camera_id)
     
+    def get_face_detection_results(self, camera_id: uuid.UUID, limit: int = 10) -> Optional[Dict[str, Any]]:
+        """Get face detection results for a specific camera."""
+        try:
+            processor = self.active_streams.get(camera_id)
+            if processor:
+                return processor.get_latest_face_detections(limit)
+            return None
+        except Exception as e:
+            logger.error(f"Error getting face detection results for camera {camera_id}: {str(e)}")
+            return None
+    
     def is_stream_active(self, camera_id: uuid.UUID) -> bool:
         """Check if a stream is actually active for a camera."""
         try:
@@ -559,6 +1020,90 @@ class StreamManager:
                 logger.info(f"Stopped all {len(camera_ids)} active streams")
             except Exception as e:
                 logger.error(f"Error stopping all streams: {str(e)}")
+    
+    def get_all_face_detection_results(self, limit_per_camera: int = 10) -> Dict[uuid.UUID, Dict[str, Any]]:
+        """Get face detection results for all active cameras."""
+        try:
+            all_results = {}
+            
+            for camera_id, processor in self.active_streams.items():
+                all_results[camera_id] = processor.get_latest_face_detections(limit_per_camera)
+            
+            return all_results
+            
+        except Exception as e:
+            logger.error(f"Error getting all face detection results: {str(e)}")
+            return {}
+    
+    async def refresh_face_recognition_embeddings(self):
+        """Refresh face recognition embeddings for all active streams."""
+        try:
+            logger.info("Refreshing face recognition embeddings for all active streams")
+            
+            # Create database session
+            db = SessionLocal()
+            
+            try:
+                # Reload face embeddings
+                face_recognition_service._load_face_embeddings(db)
+                
+                # Update all active processors
+                for camera_id, processor in self.active_streams.items():
+                    logger.info(f"Refreshed face recognition embeddings for camera {camera_id}")
+                
+                logger.info(f"Successfully refreshed face recognition embeddings for {len(self.active_streams)} active streams")
+                
+            finally:
+                db.close()
+                
+        except Exception as e:
+            logger.error(f"Error refreshing face recognition embeddings: {str(e)}")
+    
+    def get_face_detection_statistics(self) -> Dict[str, Any]:
+        """Get overall face detection statistics across all cameras."""
+        try:
+            total_faces_detected = 0
+            total_faces_recognized = 0
+            total_cameras_with_detections = 0
+            overall_recognition_accuracy = 0.0
+            total_invalid_detections = 0
+            
+            for processor in self.active_streams.values():
+                metrics = processor.face_detection_metrics
+                total_faces_detected += metrics['total_faces_detected']
+                total_faces_recognized += metrics['total_faces_recognized']
+                
+                if metrics['total_faces_detected'] > 0:
+                    total_cameras_with_detections += 1
+                    overall_recognition_accuracy += metrics['recognition_accuracy']
+            
+            # Calculate average recognition accuracy
+            if total_cameras_with_detections > 0:
+                overall_recognition_accuracy /= total_cameras_with_detections
+            
+            return {
+                "total_cameras_active": len(self.active_streams),
+                "total_cameras_with_detections": total_cameras_with_detections,
+                "total_faces_detected": total_faces_detected,
+                "total_faces_recognized": total_faces_recognized,
+                "overall_recognition_accuracy": round(overall_recognition_accuracy, 3),
+                "total_invalid_detections": total_invalid_detections,
+                "detection_quality": "high" if total_faces_detected > 0 and total_faces_recognized / max(total_faces_detected, 1) > 0.5 else "low",
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting face detection statistics: {str(e)}")
+            return {
+                "total_cameras_active": 0,
+                "total_cameras_with_detections": 0,
+                "total_faces_detected": 0,
+                "total_faces_recognized": 0,
+                "overall_recognition_accuracy": 0.0,
+                "total_invalid_detections": 0,
+                "detection_quality": "unknown",
+                "timestamp": datetime.utcnow().isoformat()
+            }
 
 
 # Global FastAPI stream manager instance

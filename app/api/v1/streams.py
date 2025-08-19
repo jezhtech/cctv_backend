@@ -180,27 +180,30 @@ async def get_mjpeg_stream(camera_id: str):
                     if processor and processor.is_running:
                         # Get the latest frame from the processor
                         if hasattr(processor, 'latest_frame') and processor.latest_frame is not None:
+                            # Get frame with bounding boxes
+                            frame_with_boxes = processor.get_frame_with_bounding_boxes()
+                            
                             # Encode frame as JPEG
                             import cv2
-                            _, buffer = cv2.imencode('.jpg', processor.latest_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                            _, buffer = cv2.imencode('.jpg', frame_with_boxes, [cv2.IMWRITE_JPEG_QUALITY, 80])
                             frame_bytes = buffer.tobytes()
                             
                             # MJPEG format
                             yield (b'--frame\r\n'
                                    b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
                             
-                            # Minimal delay for real-time streaming
-                            await asyncio.sleep(0.033)  # ~30 FPS for real-time
+                            # Slow FPS for better viewing - reduced from 30 FPS to 5 FPS
+                            await asyncio.sleep(0.2)  # ~5 FPS for slow viewing
                         else:
-                            # No frame available, minimal wait
-                            await asyncio.sleep(0.01)
+                            # No frame available, wait longer
+                            await asyncio.sleep(0.2)
                     else:
-                        # Stream not active, minimal wait
-                        await asyncio.sleep(0.01)
+                        # Stream not active, wait longer
+                        await asyncio.sleep(0.2)
                         
                 except Exception as e:
                     logger.error(f"Error generating MJPEG from memory for camera {camera_id}: {str(e)}")
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(0.2)
         
         return StreamingResponse(
             generate_mjpeg_from_memory(),
@@ -248,6 +251,135 @@ async def get_latest_frame(camera_id: str):
         raise
     except Exception as e:
         logger.error(f"Error serving latest frame for camera {camera_id}: {str(e)}")
+        raise HTTPException(
+            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+
+@streams_router.get("/{camera_id}/face-detections")
+async def get_camera_face_detections(camera_id: str, limit: int = 10):
+    """Get face detection results for a specific camera."""
+    try:
+        camera_uuid = uuid.UUID(camera_id)
+        
+        # Get face detection results
+        face_detections = stream_manager.get_face_detection_results(camera_uuid, limit)
+        
+        if face_detections is not None:
+            return face_detections
+        else:
+            raise HTTPException(
+                status_code=http_status.HTTP_404_NOT_FOUND,
+                detail="Camera stream not found or not active"
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting face detections for camera {camera_id}: {str(e)}")
+        raise HTTPException(
+            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+
+@streams_router.get("/face-detections/all")
+async def get_all_face_detections(limit_per_camera: int = 10):
+    """Get face detection results for all active cameras."""
+    try:
+        # Get all face detection results
+        all_detections = stream_manager.get_all_face_detection_results(limit_per_camera)
+        
+        return {
+            "total_cameras": len(all_detections),
+            "face_detections": all_detections
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting all face detections: {str(e)}")
+        raise HTTPException(
+            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+
+@streams_router.get("/face-detections/statistics")
+async def get_face_detection_statistics():
+    """Get overall face detection statistics across all cameras."""
+    try:
+        # Get face detection statistics
+        statistics = stream_manager.get_face_detection_statistics()
+        
+        return statistics
+        
+    except Exception as e:
+        logger.error(f"Error getting face detection statistics: {str(e)}")
+        raise HTTPException(
+            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+
+@streams_router.post("/face-recognition/refresh")
+async def refresh_face_recognition_embeddings():
+    """Refresh face recognition embeddings for all active streams."""
+    try:
+        # Refresh face recognition embeddings
+        await stream_manager.refresh_face_recognition_embeddings()
+        
+        return {
+            "success": True,
+            "message": "Face recognition embeddings refreshed successfully"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error refreshing face recognition embeddings: {str(e)}")
+        raise HTTPException(
+            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+
+@streams_router.get("/{camera_id}/frame-with-boxes")
+async def get_frame_with_bounding_boxes(camera_id: str):
+    """Get the latest frame with bounding boxes drawn around detected faces."""
+    try:
+        from fastapi.responses import Response
+        
+        camera_uuid = uuid.UUID(camera_id)
+        
+        # Get processor and frame with bounding boxes
+        processor = stream_manager.get_processor(camera_uuid)
+        if processor and processor.is_running:
+            frame_with_boxes = processor.get_frame_with_bounding_boxes()
+            
+            if frame_with_boxes is not None:
+                # Encode frame as JPEG
+                import cv2
+                _, buffer = cv2.imencode('.jpg', frame_with_boxes, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                frame_bytes = buffer.tobytes()
+                
+                return Response(
+                    content=frame_bytes,
+                    media_type="image/jpeg",
+                    headers={"Cache-Control": "no-cache"}
+                )
+            else:
+                raise HTTPException(
+                    status_code=http_status.HTTP_404_NOT_FOUND,
+                    detail="No frame with bounding boxes available"
+                )
+        else:
+            raise HTTPException(
+                status_code=http_status.HTTP_404_NOT_FOUND,
+                detail="Camera stream not found or not active"
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error serving frame with bounding boxes for camera {camera_id}: {str(e)}")
         raise HTTPException(
             status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(e)

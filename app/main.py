@@ -192,7 +192,12 @@ uploads_dir = Path("uploads")
 uploads_dir.mkdir(exist_ok=True)
 streams_dir = uploads_dir / "streams"
 streams_dir.mkdir(exist_ok=True)
+users_dir = uploads_dir / "users"
+users_dir.mkdir(exist_ok=True)
 # app.mount("/streams", StaticFiles(directory="uploads/streams"), name="streams")
+
+# Mount static files for user profile images
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 @app.get("/health/database")
 async def check_database_health_detailed():

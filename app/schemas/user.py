@@ -20,6 +20,7 @@ class UserBase(BaseModel):
 class UserCreate(UserBase):
     """Schema for creating a new user."""
     password: str = Field(..., min_length=8, description="User password")
+    profile_images: Optional[List[Dict[str, Any]]] = Field(None, description="Pre-assigned profile image names")
 
 
 class UserUpdate(BaseModel):
@@ -34,6 +35,7 @@ class UserUpdate(BaseModel):
     user_metadata: Optional[Dict[str, Any]] = None
     is_active: Optional[bool] = None
     is_verified: Optional[bool] = None
+    profile_images: Optional[List[Dict[str, Any]]] = None
 
 
 class UserResponse(UserBase):
@@ -42,12 +44,37 @@ class UserResponse(UserBase):
     is_active: bool
     is_verified: bool
     avatar_url: Optional[str]
+    profile_images: Optional[List[Dict[str, Any]]] = []
     created_at: datetime
     updated_at: datetime
     has_face_data: bool
     
     class Config:
         from_attributes = True
+
+
+class ProfileImageUpload(BaseModel):
+    """Schema for profile image upload."""
+    user_id: uuid.UUID
+    image_url: str = Field(..., description="URL of the uploaded image")
+    is_primary: bool = Field(default=False, description="Whether this is the primary profile image")
+
+
+class ProfileImageResponse(BaseModel):
+    """Schema for profile image response."""
+    id: str
+    url: str
+    is_primary: bool
+    uploaded_at: datetime
+    size: Optional[int] = None
+    content_type: Optional[str] = None
+
+
+class ProfileImageListResponse(BaseModel):
+    """Schema for profile image list response."""
+    images: List[ProfileImageResponse]
+    total: int
+    primary_image: Optional[ProfileImageResponse] = None
 
 
 class FaceEmbeddingBase(BaseModel):
@@ -176,7 +203,7 @@ class AttendanceWithUser(AttendanceResponse):
 
 class UserListResponse(BaseModel):
     """Schema for paginated user list response."""
-    users: List[UserResponse]
+    data: List[UserResponse]
     total: int
     page: int
     size: int

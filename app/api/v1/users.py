@@ -1,21 +1,32 @@
 """User and face recognition API endpoints."""
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Query, status, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, Query, status, UploadFile, File, Form
 from sqlalchemy.orm import Session
 import uuid
 import base64
+import os
+from pathlib import Path
+from datetime import datetime
 
 from app.core.database import get_db
+from app.models.database.user import User
 from app.schemas.user import (
     UserCreate, UserUpdate, UserResponse, UserListResponse,
     FaceEmbeddingCreate, FaceEmbeddingResponse, FaceRecognitionRequest,
     FaceRecognitionResponse, FaceUploadRequest, FaceUploadResponse,
-    AttendanceCreate, AttendanceUpdate, AttendanceResponse, AttendanceListResponse
+    AttendanceCreate, AttendanceUpdate, AttendanceResponse, AttendanceListResponse,
+    ProfileImageUpload, ProfileImageResponse, ProfileImageListResponse
 )
 from app.services.face_recognition.face_service import face_recognition_service
 from app.services.user.user_service import user_service
 
 users_router = APIRouter()
+
+# File upload configuration
+UPLOAD_DIR = Path("uploads/users")
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
+ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif"}
 
 
 # User management endpoints
@@ -56,7 +67,7 @@ async def get_users(
         page = (skip // limit) + 1
         
         return UserListResponse(
-            users=users,
+            data=users,
             total=total,
             page=page,
             size=len(users),
@@ -425,4 +436,226 @@ async def get_attendance_statistics(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get attendance statistics: {str(e)}"
+        )
+
+
+# Profile image management endpoints
+@users_router.post("/{user_id}/profile-images", response_model=ProfileImageResponse)
+async def upload_profile_image(
+    user_id: uuid.UUID,
+    file: UploadFile = File(...),
+    image_name: str = Form(..., description="Name of the image to upload"),
+    db: Session = Depends(get_db)
+):
+    """Upload a profile image for a user with a specific name."""
+    try:
+        # Check if user exists
+        user = await user_service.get_user(db, user_id)
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found"
+            )
+        
+        # Validate file
+        if not file.content_type.startswith('image/'):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="File must be an image"
+            )
+        
+        # Check file size
+        file_content = await file.read()
+        if len(file_content) > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"File size must be less than {MAX_FILE_SIZE // (1024*1024)}MB"
+            )
+        
+        # Check file extension
+        file_extension = Path(file.filename).suffix.lower()
+        if file_extension not in ALLOWED_EXTENSIONS:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"File extension must be one of: {', '.join(ALLOWED_EXTENSIONS)}"
+            )
+        
+        # Use the provided image name with extension
+        filename = f"{image_name}{file_extension}"
+        file_path = UPLOAD_DIR / filename
+        
+        # Save file
+        with open(file_path, "wb") as f:
+            f.write(file_content)
+        
+        # Return success response - no user update needed
+        return ProfileImageResponse(
+            id=str(uuid.uuid4()),
+            url=f"/uploads/users/{filename}",
+            is_primary=False,
+            uploaded_at=datetime.now(),
+            size=len(file_content),
+            content_type=file.content_type
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to upload profile image: {str(e)}"
+        )
+
+
+@users_router.get("/{user_id}/profile-images", response_model=ProfileImageListResponse)
+async def get_user_profile_images(
+    user_id: uuid.UUID,
+    db: Session = Depends(get_db)
+):
+    """Get all profile images for a user."""
+    try:
+        # Check if user exists
+        user = await user_service.get_user(db, user_id)
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found"
+            )
+        
+        profile_images = user.profile_images_list
+        primary_image = next((img for img in profile_images if img.get('is_primary', False)), None)
+        
+        return ProfileImageListResponse(
+            images=[
+                ProfileImageResponse(
+                    id=img["id"],
+                    url=f"/uploads/users/{img['filename']}",
+                    is_primary=img.get("is_primary", False),
+                    uploaded_at=datetime.fromisoformat(img["uploaded_at"]),
+                    size=img.get("size"),
+                    content_type=img.get("content_type")
+                )
+                for img in profile_images
+            ],
+            total=len(profile_images),
+            primary_image=ProfileImageResponse(
+                id=primary_image["id"],
+                url=f"/uploads/users/{primary_image['filename']}",
+                is_primary=primary_image["is_primary"],
+                uploaded_at=datetime.fromisoformat(primary_image["uploaded_at"]),
+                size=primary_image.get("size"),
+                content_type=primary_image.get("content_type")
+            ) if primary_image else None
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get profile images: {str(e)}"
+        )
+
+
+@users_router.delete("/{user_id}/profile-images/{image_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_profile_image(
+    user_id: uuid.UUID,
+    image_id: str,
+    db: Session = Depends(get_db)
+):
+    """Delete a profile image for a user."""
+    try:
+        # Check if user exists
+        user = await user_service.get_user(db, user_id)
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found"
+            )
+        
+        profile_images = user.profile_images_list
+        image_to_delete = next((img for img in profile_images if img["id"] == image_id), None)
+        
+        if not image_to_delete:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Profile image not found"
+            )
+        
+        # Remove image from list
+        profile_images = [img for img in profile_images if img["id"] != image_id]
+        
+        # Update user
+        update_data = UserUpdate(profile_images=profile_images)
+        await user_service.update_user(db, user_id, update_data)
+        
+        # Delete file from disk
+        try:
+            file_path = UPLOAD_DIR / image_to_delete["filename"]
+            if file_path.exists():
+                file_path.unlink()
+        except Exception as e:
+            # Log error but don't fail the request
+            print(f"Failed to delete file {file_path}: {e}")
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete profile image: {str(e)}"
+        )
+
+
+@users_router.put("/{user_id}/profile-images/{image_id}/primary", response_model=ProfileImageResponse)
+async def set_primary_profile_image(
+    user_id: uuid.UUID,
+    image_id: str,
+    db: Session = Depends(get_db)
+):
+    """Set a profile image as primary."""
+    try:
+        # Check if user exists
+        user = await user_service.get_user(db, user_id)
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found"
+            )
+        
+        profile_images = user.profile_images_list
+        target_image = next((img for img in profile_images if img["id"] == image_id), None)
+        
+        if not target_image:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Profile image not found"
+            )
+        
+        # Update all images to remove primary flag
+        for img in profile_images:
+            img["is_primary"] = False
+        
+        # Set target image as primary
+        target_image["is_primary"] = True
+        
+        # Update user
+        update_data = UserUpdate(profile_images=profile_images)
+        await user_service.update_user(db, user_id, update_data)
+        
+        return ProfileImageResponse(
+            id=target_image["id"],
+            url=f"/uploads/users/{target_image['filename']}",
+            is_primary=target_image["is_primary"],
+            uploaded_at=datetime.fromisoformat(target_image["uploaded_at"]),
+            size=target_image.get("size"),
+            content_type=target_image.get("content_type")
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to set primary profile image: {str(e)}"
         )
