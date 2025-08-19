@@ -1,5 +1,5 @@
 """User and face recognition API endpoints."""
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, Query, status, UploadFile, File, Form
 from sqlalchemy.orm import Session
 import uuid
@@ -447,7 +447,7 @@ async def upload_profile_image(
     image_name: str = Form(..., description="Name of the image to upload"),
     db: Session = Depends(get_db)
 ):
-    """Upload a profile image for a user with a specific name."""
+    """Upload a profile image for a user with a specific name and extract face embeddings."""
     try:
         # Check if user exists
         user = await user_service.get_user(db, user_id)
@@ -488,7 +488,53 @@ async def upload_profile_image(
         with open(file_path, "wb") as f:
             f.write(file_content)
         
-        # Return success response - no user update needed
+        # Extract face embeddings from the uploaded image
+        try:
+            # Convert file content to base64 for face recognition service
+            import base64
+            image_data = base64.b64encode(file_content).decode('utf-8')
+            
+            # Create face upload request
+            from app.schemas.user import FaceUploadRequest
+            face_request = FaceUploadRequest(
+                user_id=user_id,
+                image_data=image_data,
+                is_primary=False,  # Will be set based on profile image primary status
+                source_description=f"Profile image: {filename}"
+            )
+            
+            # Extract face embeddings using the face recognition service
+            face_result = await face_recognition_service.upload_face_image(db, face_request)
+            
+            # Store face embeddings in database
+            if face_result.get('success'):
+                total_faces = face_result.get('total_faces_processed', 1)
+                print(f"Face embeddings created successfully for user {user_id}")
+                print(f"Total faces processed: {total_faces}")
+                print(f"Confidence: {face_result.get('confidence_score', 'N/A')}")
+                print(f"Quality: {face_result.get('face_quality_score', 'N/A')}")
+                
+                # Log details for each face if multiple
+                if total_faces > 1:
+                    embeddings = face_result.get('embeddings', [])
+                    for emb in embeddings:
+                        print(f"  Face {emb.get('face_number', '?')}: ID={emb.get('id', 'N/A')}, Primary={emb.get('is_primary', False)}")
+            else:
+                print(f"No face embeddings extracted from image {filename}: {face_result.get('message', 'Unknown error')}")
+                
+        except Exception as face_error:
+            # Log face extraction error but don't fail the upload
+            print(f"Face embedding extraction failed for image {filename}: {face_error}")
+            # Log more details for debugging
+            import traceback
+            print(f"Face extraction error details: {traceback.format_exc()}")
+            # Rollback any failed database transaction
+            try:
+                db.rollback()
+            except:
+                pass
+        
+        # Return success response
         return ProfileImageResponse(
             id=str(uuid.uuid4()),
             url=f"/uploads/users/{filename}",
@@ -504,6 +550,128 @@ async def upload_profile_image(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to upload profile image: {str(e)}"
+        )
+
+
+@users_router.post("/{user_id}/profile-images/{image_id}/extract-faces", response_model=Dict[str, Any])
+async def extract_faces_from_profile_image(
+    user_id: uuid.UUID,
+    image_id: str,
+    db: Session = Depends(get_db)
+):
+    """Extract face embeddings from a specific profile image."""
+    try:
+        # Check if user exists
+        user = await user_service.get_user(db, user_id)
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found"
+            )
+        
+        # Find the profile image
+        profile_images = user.profile_images_list
+        target_image = next((img for img in profile_images if img["id"] == image_id), None)
+        
+        if not target_image:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Profile image not found"
+            )
+        
+        # Read the image file
+        image_path = UPLOAD_DIR / target_image["filename"]
+        if not image_path.exists():
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Image file not found"
+            )
+        
+        # Read and encode image
+        with open(image_path, "rb") as f:
+            image_content = f.read()
+        
+        image_data = base64.b64encode(image_content).decode('utf-8')
+        
+        # Create face upload request
+        face_request = FaceUploadRequest(
+            user_id=user_id,
+            image_data=image_data,
+            is_primary=target_image.get("is_primary", False),
+            source_description=f"Profile image: {target_image['filename']}"
+        )
+        
+        # Extract face embeddings
+        face_result = await face_recognition_service.upload_face_image(db, face_request)
+        
+        return {
+            "success": True,
+            "message": "Face embeddings extracted successfully",
+            "image_id": image_id,
+            "face_result": face_result
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to extract face embeddings: {str(e)}"
+        )
+
+
+@users_router.get("/{user_id}/face-embeddings", response_model=Dict[str, Any])
+async def get_user_face_embeddings(
+    user_id: uuid.UUID,
+    db: Session = Depends(get_db)
+):
+    """Get all face embeddings for a user."""
+    try:
+        # Check if user exists
+        user = await user_service.get_user(db, user_id)
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found"
+            )
+        
+        # Get face embeddings from database
+        from app.models.database.user import FaceEmbedding
+        face_embeddings = db.query(FaceEmbedding).filter(
+            FaceEmbedding.user_id == user_id
+        ).all()
+        
+        # Convert to response format
+        embeddings_data = []
+        for embedding in face_embeddings:
+            embeddings_data.append({
+                "id": str(embedding.id),
+                "confidence_score": embedding.confidence_score,
+                "face_quality_score": embedding.face_quality_score,
+                "is_primary": embedding.is_primary,
+                "face_image_url": embedding.face_image_url,
+                "source_image": embedding.source_image,
+                "face_size": embedding.face_size,
+                "face_angle": embedding.face_angle,
+                "lighting_score": embedding.lighting_score,
+                "blur_score": embedding.blur_score,
+                "created_at": embedding.created_at.isoformat() if embedding.created_at else None,
+                "updated_at": embedding.updated_at.isoformat() if embedding.updated_at else None
+            })
+        
+        return {
+            "success": True,
+            "user_id": str(user_id),
+            "total_embeddings": len(embeddings_data),
+            "embeddings": embeddings_data
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get face embeddings: {str(e)}"
         )
 
 

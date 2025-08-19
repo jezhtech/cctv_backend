@@ -102,6 +102,12 @@ class FaceEmbedding(Base, TimestampMixin):
     source_image = Column(String(500), nullable=True)
     is_primary = Column(Boolean, default=False, nullable=False)  # Primary face for user
     
+    # Additional fields for better recognition
+    face_size = Column(JSON, nullable=True)  # Width and height of detected face
+    face_angle = Column(Float, nullable=True)  # Face angle/orientation
+    lighting_score = Column(Float, nullable=True)  # Lighting quality score
+    blur_score = Column(Float, nullable=True)  # Blur/quality score
+    
     # Relationships
     user = relationship("User", back_populates="face_embeddings")
     

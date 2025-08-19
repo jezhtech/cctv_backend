@@ -1,6 +1,6 @@
 """Streaming API endpoints for handling camera streams directly in FastAPI."""
 from typing import Dict, Any, Optional
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi import status as http_status
 from sqlalchemy.orm import Session
 import uuid
@@ -156,8 +156,12 @@ async def stop_all_streams():
 
 
 @streams_router.get("/{camera_id}/mjpeg")
-async def get_mjpeg_stream(camera_id: str):
-    """Get MJPEG stream for a camera from in-memory storage."""
+async def get_mjpeg_stream(
+    camera_id: str, 
+    show_faces: bool = Query(True, description="Show face detection with bounding boxes and names"),
+    fps: int = Query(5, description="Frames per second (1-30)", ge=1, le=30)
+):
+    """Get MJPEG stream for a camera with optional face detection and recognition."""
     try:
         from fastapi.responses import StreamingResponse
         import asyncio
@@ -171,6 +175,9 @@ async def get_mjpeg_stream(camera_id: str):
                 detail="Stream not found or not active"
             )
         
+        # Calculate sleep time based on FPS
+        sleep_time = 1.0 / fps if fps > 0 else 0.2
+        
         # Return MJPEG stream from in-memory storage
         async def generate_mjpeg_from_memory():
             while True:
@@ -180,8 +187,12 @@ async def get_mjpeg_stream(camera_id: str):
                     if processor and processor.is_running:
                         # Get the latest frame from the processor
                         if hasattr(processor, 'latest_frame') and processor.latest_frame is not None:
-                            # Get frame with bounding boxes
-                            frame_with_boxes = processor.get_frame_with_bounding_boxes()
+                            if show_faces:
+                                # Get frame with bounding boxes and names
+                                frame_with_boxes = processor.get_frame_with_bounding_boxes()
+                            else:
+                                # Get frame without face detection
+                                frame_with_boxes = processor.latest_frame.copy()
                             
                             # Encode frame as JPEG
                             import cv2
@@ -192,8 +203,8 @@ async def get_mjpeg_stream(camera_id: str):
                             yield (b'--frame\r\n'
                                    b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
                             
-                            # Slow FPS for better viewing - reduced from 30 FPS to 5 FPS
-                            await asyncio.sleep(0.2)  # ~5 FPS for slow viewing
+                            # Control FPS
+                            await asyncio.sleep(sleep_time)
                         else:
                             # No frame available, wait longer
                             await asyncio.sleep(0.2)
@@ -384,3 +395,6 @@ async def get_frame_with_bounding_boxes(camera_id: str):
             status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(e)
         )
+
+
+

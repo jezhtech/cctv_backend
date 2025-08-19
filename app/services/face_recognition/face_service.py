@@ -151,12 +151,22 @@ class FaceRecognitionService:
                     # Calculate quality score
                     quality_score = self._calculate_face_quality(image, face_bbox)
                     
+                    # Calculate additional metrics
+                    face_size = {"width": face_bbox["width"], "height": face_bbox["height"]}
+                    face_angle = self._calculate_face_angle(face_bbox, landmarks)
+                    lighting_score = self._calculate_lighting_score(image, face_bbox)
+                    blur_score = self._calculate_blur_score(image, face_bbox)
+                    
                     results.append({
                         "embedding": embedding,
                         "bbox": face_bbox,
                         "landmarks": landmarks,
                         "confidence": float(face.det_score),
-                        "quality_score": quality_score
+                        "quality_score": quality_score,
+                        "size": face_size,
+                        "angle": face_angle,
+                        "lighting_score": lighting_score,
+                        "blur_score": blur_score
                     })
             
             return results
@@ -198,6 +208,106 @@ class FaceRecognitionService:
             logger.error(f"Failed to calculate face quality: {str(e)}")
             return 0.0
     
+    def _calculate_face_angle(self, bbox: Dict[str, int], landmarks: List[List[int]]) -> float:
+        """Calculate face angle/orientation based on landmarks."""
+        try:
+            if not landmarks or len(landmarks) < 5:
+                return 0.0
+            
+            # Use eye landmarks to calculate face angle
+            # Assuming landmarks[0] and landmarks[1] are left and right eye centers
+            if len(landmarks) >= 2:
+                left_eye = np.array(landmarks[0])
+                right_eye = np.array(landmarks[1])
+                
+                # Calculate angle between eyes
+                eye_vector = right_eye - left_eye
+                angle = np.arctan2(eye_vector[1], eye_vector[0]) * 180 / np.pi
+                
+                # Normalize to -90 to 90 degrees
+                if angle > 90:
+                    angle -= 180
+                elif angle < -90:
+                    angle += 180
+                
+                return float(angle)
+            
+            return 0.0
+            
+        except Exception as e:
+            logger.error(f"Failed to calculate face angle: {str(e)}")
+            return 0.0
+    
+    def _calculate_lighting_score(self, image: np.ndarray, bbox: Dict[str, int]) -> float:
+        """Calculate lighting quality score for face region."""
+        try:
+            x, y, w, h = bbox["x"], bbox["y"], bbox["width"], bbox["height"]
+            
+            # Extract face region
+            face_region = image[y:y+h, x:x+w]
+            
+            if face_region.size == 0:
+                return 0.0
+            
+            # Convert to grayscale
+            gray = cv2.cvtColor(face_region, cv2.COLOR_BGR2GRAY)
+            
+            # Calculate lighting metrics
+            mean_brightness = np.mean(gray)
+            std_brightness = np.std(gray)
+            
+            # Ideal lighting: mean around 128, good contrast (std > 20)
+            brightness_score = 1.0 - abs(mean_brightness - 128) / 128
+            contrast_score = min(1.0, std_brightness / 50)
+            
+            # Combine scores
+            lighting_score = (brightness_score + contrast_score) / 2
+            
+            return max(0.0, min(1.0, lighting_score))
+            
+        except Exception as e:
+            logger.error(f"Failed to calculate lighting score: {str(e)}")
+            return 0.0
+    
+    def _calculate_blur_score(self, image: np.ndarray, bbox: Dict[str, int]) -> float:
+        """Calculate blur/quality score for face region."""
+        try:
+            x, y, w, h = bbox["x"], bbox["y"], bbox["width"], bbox["height"]
+            
+            # Extract face region
+            face_region = image[y:y+h, x:x+w]
+            
+            if face_region.size == 0:
+                return 0.0
+            
+            # Convert to grayscale
+            gray = cv2.cvtColor(face_region, cv2.COLOR_BGR2GRAY)
+            
+            # Calculate Laplacian variance (measure of sharpness)
+            laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+            
+            # Normalize blur score (higher variance = less blur)
+            blur_score = min(1.0, laplacian_var / 500)
+            
+            return max(0.0, min(1.0, blur_score))
+            
+        except Exception as e:
+            logger.error(f"Failed to calculate blur score: {str(e)}")
+            return 0.0
+    
+    def _convert_numpy_types(self, value):
+        """Convert numpy types to native Python types for database storage."""
+        if hasattr(value, 'item'):  # numpy scalar
+            return value.item()
+        elif isinstance(value, np.ndarray):
+            return value.tolist()
+        elif isinstance(value, dict):
+            return {k: self._convert_numpy_types(v) for k, v in value.items()}
+        elif isinstance(value, list):
+            return [self._convert_numpy_types(item) for item in value]
+        else:
+            return value
+    
     def _find_similar_faces(self, query_embedding: np.ndarray, threshold: float = None) -> List[Tuple[int, float]]:
         """Find similar faces using FAISS index."""
         try:
@@ -210,11 +320,29 @@ class FaceRecognitionService:
             query_vector = query_embedding.reshape(1, -1)
             similarities, indices = self.face_index.search(query_vector, k=min(10, len(self.face_embeddings)))
             
-            results = []
+            # Track best match per user to avoid duplicate user matches
+            best_per_user = {}
+            
             for i, (similarity, idx) in enumerate(zip(similarities[0], indices[0])):
                 if similarity >= threshold and idx < len(self.face_embeddings):
                     embedding_id = self.face_embeddings[idx]
-                    results.append((embedding_id, float(similarity)))
+                    user_id = self.user_embeddings.get(embedding_id)
+                    
+                    if user_id:
+                        # Keep only the best match per user
+                        if user_id not in best_per_user or similarity > best_per_user[user_id][1]:
+                            best_per_user[user_id] = (embedding_id, float(similarity))
+            
+            # Return results sorted by similarity (best first)
+            results = list(best_per_user.values())
+            results.sort(key=lambda x: x[1], reverse=True)
+            
+            # Add additional logging to debug face matching
+            if results:
+                logger.debug(f"Face recognition results: {len(results)} matches found")
+                for i, (embedding_id, similarity) in enumerate(results):
+                    user_id = self.user_embeddings.get(embedding_id)
+                    logger.debug(f"  Match {i+1}: User {user_id}, Similarity: {similarity:.3f}")
             
             return results
             
@@ -354,61 +482,100 @@ class FaceRecognitionService:
                     "processing_time_ms": 0
                 }
             
-            if len(faces) > 1:
-                return {
-                    "success": False,
-                    "message": "Multiple faces detected. Please upload image with single face.",
-                    "processing_time_ms": 0
-                }
+            # Process all detected faces (support multiple faces)
+            created_embeddings = []
+            primary_face_processed = False
             
-            face = faces[0]
-            
-            # Encode embedding to base64
-            embedding_bytes = face["embedding"].tobytes()
-            embedding_b64 = base64.b64encode(embedding_bytes).decode('utf-8')
-            
-            # Save face image (you might want to implement file storage service)
-            face_image_url = f"faces/{user.id}/{uuid.uuid4()}.jpg"
-            
-            # Create face embedding record
-            face_embedding = FaceEmbedding(
-                user_id=request.user_id,
-                embedding=embedding_b64,
-                face_image_url=face_image_url,
-                confidence_score=face["confidence"],
-                face_quality_score=face["quality_score"],
-                face_bbox=face["bbox"],
-                landmarks=face["landmarks"],
-                source_image=request.source_description,
-                is_primary=request.is_primary
-            )
-            
-            # If this is primary, unset other primary embeddings
-            if request.is_primary:
-                db.query(FaceEmbedding).filter(
-                    and_(
-                        FaceEmbedding.user_id == request.user_id,
-                        FaceEmbedding.is_primary == True
+            for i, face in enumerate(faces):
+                try:
+                    # Encode embedding to base64
+                    embedding_bytes = face["embedding"].tobytes()
+                    embedding_b64 = base64.b64encode(embedding_bytes).decode('utf-8')
+                    
+                    # Use the actual uploaded image URL from our storage
+                    # The image is already saved in uploads/users/ directory
+                    # We'll construct the URL based on the source description
+                    if request.source_description and "Profile image:" in request.source_description:
+                        # Extract filename from source description (e.g., "Profile image: img_001_1703123456789_a1b2c3")
+                        filename = request.source_description.split("Profile image: ")[-1]
+                        face_image_url = f"/uploads/users/{filename}"
+                    else:
+                        # Fallback for other sources
+                        face_image_url = f"/uploads/faces/{request.user_id}/{uuid.uuid4()}.jpg"
+                    
+                    # Determine if this should be primary (first face or explicitly marked)
+                    is_primary = (i == 0 and request.is_primary) or (i == 0 and not primary_face_processed)
+                    
+                    # Create face embedding record with all numpy types converted to native Python types
+                    face_embedding = FaceEmbedding(
+                        user_id=request.user_id,
+                        embedding=embedding_b64,
+                        face_image_url=face_image_url,
+                        confidence_score=self._convert_numpy_types(face["confidence"]),
+                        face_quality_score=self._convert_numpy_types(face["quality_score"]),
+                        face_bbox=self._convert_numpy_types(face["bbox"]),
+                        landmarks=self._convert_numpy_types(face["landmarks"]),
+                        source_image=f"{request.source_description} (Face {i+1})",
+                        is_primary=is_primary,
+                        # Add new quality metrics - convert numpy types to native Python types
+                        face_size=self._convert_numpy_types(face.get("size", {"width": 0, "height": 0})),
+                        face_angle=self._convert_numpy_types(face.get("angle", 0.0)),
+                        lighting_score=self._convert_numpy_types(face.get("lighting_score", 0.0)),
+                        blur_score=self._convert_numpy_types(face.get("blur_score", 0.0))
                     )
-                ).update({"is_primary": False})
+                    
+                    # If this is primary, unset other primary embeddings for this user
+                    if is_primary:
+                        db.query(FaceEmbedding).filter(
+                            and_(
+                                FaceEmbedding.user_id == request.user_id,
+                                FaceEmbedding.is_primary == True
+                            )
+                        ).update({"is_primary": False})
+                        primary_face_processed = True
+                    
+                    db.add(face_embedding)
+                    db.flush()  # Flush to get the ID
+                    
+                    # Add to created embeddings list
+                    created_embeddings.append({
+                        "id": str(face_embedding.id),
+                        "confidence_score": face_embedding.confidence_score,
+                        "face_quality_score": face_embedding.face_quality_score,
+                        "is_primary": face_embedding.is_primary,
+                        "face_number": i + 1,
+                        "total_faces": len(faces)
+                    })
+                    
+                except Exception as face_error:
+                    logger.error(f"Failed to process face {i+1}: {str(face_error)}")
+                    continue
             
-            db.add(face_embedding)
+            # Commit all face embeddings
             db.commit()
-            db.refresh(face_embedding)
             
             # Reload face embeddings
             self._load_face_embeddings(db)
             
             processing_time = (time.time() - start_time) * 1000
             
-            return {
-                "success": True,
-                "face_embedding_id": face_embedding.id,
-                "confidence_score": face["confidence"],
-                "face_quality_score": face["quality_score"],
-                "message": "Face image uploaded and processed successfully",
-                "processing_time_ms": round(processing_time, 2)
-            }
+            if created_embeddings:
+                return {
+                    "success": True,
+                    "face_embedding_id": created_embeddings[0]["id"],  # Return first one for backward compatibility
+                    "confidence_score": created_embeddings[0]["confidence_score"],
+                    "face_quality_score": created_embeddings[0]["face_quality_score"],
+                    "message": f"Successfully processed {len(created_embeddings)} faces from image",
+                    "processing_time_ms": round(processing_time, 2),
+                    "total_faces_processed": len(created_embeddings),
+                    "embeddings": created_embeddings
+                }
+            else:
+                return {
+                    "success": False,
+                    "message": "Failed to process any faces from image",
+                    "processing_time_ms": round(processing_time, 2)
+                }
             
         except Exception as e:
             processing_time = (time.time() - start_time) * 1000
