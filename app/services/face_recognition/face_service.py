@@ -5,7 +5,7 @@ import base64
 import time
 from typing import List, Optional, Dict, Any, Tuple
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, desc
+from sqlalchemy import and_
 from loguru import logger
 import uuid
 from datetime import datetime, timedelta
@@ -18,7 +18,6 @@ import os
 from app.models.database.user import User, FaceEmbedding, FaceDetection, Attendance
 from app.schemas.user import FaceRecognitionRequest, FaceUploadRequest
 from app.core.config import settings
-from app.core.celery_app import celery_app
 
 
 class FaceRecognitionService:
@@ -766,16 +765,3 @@ class FaceRecognitionService:
 
 # Global face recognition service instance
 face_recognition_service = FaceRecognitionService()
-
-
-# Celery tasks
-@celery_app.task(name="app.services.face_recognition.face_service.cleanup_old_detections")
-def cleanup_old_detections():
-    """Periodic task to cleanup old face detection records."""
-    from app.core.database import SessionLocal
-    
-    db = SessionLocal()
-    try:
-        face_recognition_service.cleanup_old_detections(db)
-    finally:
-        db.close()

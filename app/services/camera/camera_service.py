@@ -4,14 +4,13 @@ import cv2
 import time
 from typing import List, Optional, Dict, Any, Tuple
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, or_, desc
+from sqlalchemy import and_, desc
 from loguru import logger
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from app.models.database.camera import Camera, CameraStream
 from app.schemas.camera import CameraCreate, CameraUpdate, CameraTestConnection
-from app.core.celery_app import celery_app
 from app.services.streaming.stream_service import stream_manager
 
 
@@ -210,47 +209,7 @@ class CameraService:
         finally:
             if cap:
                 cap.release()
-    
-    async def start_camera_stream(self, camera_id: uuid.UUID) -> bool:
-        """Start streaming from a camera."""
-        try:
-            # Check if stream is already active
-            if camera_id in self.active_streams:
-                logger.info(f"Stream already active for camera {camera_id}")
-                return True
-            
-            # Start stream using Celery task
-            task = celery_app.send_task(
-                "app.services.streaming.stream_service.start_camera_stream",
-                args=[str(camera_id)]
-            )
-            
-            logger.info(f"Started camera stream task for camera {camera_id}: {task.id}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to start camera stream {camera_id}: {str(e)}")
-            return False
-    
-    async def stop_camera_stream(self, camera_id: uuid.UUID) -> bool:
-        """Stop streaming from a camera."""
-        try:
-            if camera_id in self.active_streams:
-                # Stop stream using Celery task
-                task = celery_app.send_task(
-                    "app.services.streaming.stream_service.stop_camera_stream",
-                    args=[str(camera_id)]
-                )
-                
-                logger.info(f"Stopped camera stream for camera {camera_id}: {task.id}")
-                return True
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to stop camera stream {camera_id}: {str(e)}")
-            return False
-    
+   
     async def get_camera_health(self, db: Session, camera_id: uuid.UUID) -> Dict[str, Any]:
         """Get camera health status."""
         try:
@@ -370,24 +329,3 @@ class CameraService:
 
 # Global camera service instance
 camera_service = CameraService()
-
-
-# Celery tasks
-@celery_app.task(name="app.services.camera.camera_service.check_camera_health")
-def check_camera_health():
-    """Periodic task to check camera health."""
-    from app.core.database import SessionLocal
-    
-    db = SessionLocal()
-    try:
-        # Get all active cameras
-        cameras, _ = camera_service.get_cameras(db, active_only=True)
-        
-        for camera in cameras:
-            try:
-                health = camera_service.get_camera_health(db, camera.id)
-                logger.info(f"Camera {camera.id} health: {health}")
-            except Exception as e:
-                logger.error(f"Failed to check health for camera {camera.id}: {str(e)}")
-    finally:
-        db.close()

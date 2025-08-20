@@ -19,8 +19,7 @@ RUN apt-get update && apt-get install -y \
     libpng-dev \
     libtiff-dev \
     python3-dev \
-    python3-pip \
-    python3-venv \
+    curl \
     # OpenCV dependencies
     libgl1 \
     libglib2.0-0 \
@@ -52,13 +51,16 @@ RUN mkdir -p logs uploads models
 
 # Set permissions
 RUN chmod +x start.py
-RUN chmod +x celery_worker.py
 
-# Add the current directory to Python path for Celery
+# Add the current directory to Python path
 ENV PYTHONPATH=/app
 
-# Expose port (if needed for the main app)
+# Expose port for the backend server
 EXPOSE 8000
 
-# Default command (can be overridden in docker-compose)
+# Health check for the backend server
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Default command to run the backend server
 CMD ["python", "start.py"]

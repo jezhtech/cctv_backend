@@ -12,7 +12,6 @@ from datetime import datetime
 from loguru import logger
 import sys
 from pathlib import Path
-import asyncio
 
 from app.core.config import settings
 from app.api.v1 import api_router

@@ -1,4 +1,38 @@
 services:
+  backend:
+    build: .
+    container_name: smart_attendance_backend
+    restart: always
+    working_dir: /app
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./app:/app/app
+      - ./models:/app/models
+      - ./uploads:/app/uploads
+      - ./logs:/app/logs
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/smart_attendance_service
+      - REDIS_URL=redis://redis:6379/0
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - PYTHONPATH=/app
+      - SECRET_KEY=your-super-secret-key-here-make-it-long-enough-32-chars
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - smart-attendance-backend
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
   db:
     image: postgres:15
     container_name: postgres_db
@@ -35,50 +69,6 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
-
-  celery:
-    build: .
-    container_name: celery_worker
-    restart: always
-    working_dir: /app
-    command: celery -A app.core.celery_app:celery_app worker --loglevel=info --concurrency=1
-    volumes:
-      - ./app:/app/app
-      - ./models:/app/models
-      - ./app/core:/app/app/core
-    environment:
-      - DATABASE_URL=postgresql://postgres:postgres@db:5432/smart_attendance_service
-      - REDIS_URL=redis://redis:6379/0
-      - CELERY_BROKER_URL=redis://redis:6379/0
-      - CELERY_RESULT_BACKEND=redis://redis:6379/0
-      - PYTHONPATH=/app
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    networks:
-      - smart-attendance-backend
-
-  flower:
-    build: .
-    container_name: flower_monitor
-    restart: always
-    working_dir: /app
-    command: celery -A app.core.celery_app:celery_app flower --port=5555
-    ports:
-      - "5555:5555"
-    environment:
-      - DATABASE_URL=postgresql://postgres:postgres@db:5432/smart_attendance_service
-      - REDIS_URL=redis://redis:6379/0
-      - CELERY_BROKER_URL=redis://redis:6379/0
-      - CELERY_RESULT_BACKEND=redis://redis:6379/0
-      - PYTHONPATH=/app
-    depends_on:
-      - celery
-    networks:
-      - smart-attendance-backend
-
 volumes:
   postgres_data:
   redis_data:

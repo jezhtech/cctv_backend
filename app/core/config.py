@@ -42,40 +42,12 @@ class Settings(BaseSettings):
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
     
     # Face Recognition
-    FACE_MODEL_PATH: str = "models/arcface.onnx"
     FACE_DETECTION_CONFIDENCE: float = 0.6
     FACE_RECOGNITION_THRESHOLD: float = 0.85  # Made much stricter (85%) to prevent false recognition
     MAX_FACES_PER_IMAGE: int = 10
     
-    # Camera Settings
-    RTSP_FRAME_RATE: int = 5
-    RTSP_TIMEOUT: int = 30
-    RTSP_BUFFER_SIZE: int = 1024
-    MAX_CAMERAS: int = 50
-    
-    # Streaming
-    STREAM_QUALITY: int = 80
-    STREAM_MAX_FPS: int = 60
-    STREAM_BUFFER_SIZE: int = 100
-    
-    # File Storage
-    UPLOAD_DIR: str = "uploads"
-    MAX_FILE_SIZE: int = 10 * 1024 * 1024  # 10MB
-    ALLOWED_IMAGE_EXTENSIONS: list = ["jpg", "jpeg", "png", "bmp"]
-    
     # Logging
     LOG_LEVEL: str = "INFO"
-    LOG_FORMAT: str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    
-    # Monitoring
-    ENABLE_METRICS: bool = True
-    METRICS_PORT: int = 9090
-    
-    # Celery
-    CELERY_BROKER_URL: str = Field(default="redis://localhost:6379/0")
-    CELERY_RESULT_BACKEND: str = Field(default="redis://localhost:6379/0")
-    CELERY_TASK_SOFT_TIME_LIMIT: int = 300
-    CELERY_TASK_TIME_LIMIT: int = 600
     
     @validator("DATABASE_URL")
     def validate_database_url(cls, v):
@@ -92,6 +64,7 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         case_sensitive = True
+        extra = "ignore"  # Ignore extra environment variables not defined in the model
 
 
 # Global settings instance

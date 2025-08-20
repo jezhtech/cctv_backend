@@ -20,17 +20,28 @@ class RedisService:
             return
             
         try:
-            # Create Redis connection pool
-            self.redis_client = redis.Redis(
-                host=settings.REDIS_HOST,
-                port=settings.REDIS_PORT,
-                db=settings.REDIS_DB,
-                password=settings.REDIS_PASSWORD,
-                decode_responses=True,
-                socket_connect_timeout=5,
-                socket_timeout=5,
-                retry_on_timeout=True
-            )
+            # Parse REDIS_URL if available, otherwise use individual settings
+            if hasattr(settings, 'REDIS_URL') and settings.REDIS_URL != "redis://localhost:6379/0":
+                # Use REDIS_URL from environment
+                self.redis_client = redis.from_url(
+                    settings.REDIS_URL,
+                    decode_responses=True,
+                    socket_connect_timeout=5,
+                    socket_timeout=5,
+                    retry_on_timeout=True
+                )
+            else:
+                # Fallback to individual settings
+                self.redis_client = redis.Redis(
+                    host=settings.REDIS_HOST,
+                    port=settings.REDIS_PORT,
+                    db=settings.REDIS_DB,
+                    password=settings.REDIS_PASSWORD,
+                    decode_responses=True,
+                    socket_connect_timeout=5,
+                    socket_timeout=5,
+                    retry_on_timeout=True
+                )
             
             # Test connection
             await self.redis_client.ping()
