@@ -26,8 +26,8 @@ class Camera(Base, TimestampMixin, SoftDeleteMixin):
     # Camera Settings
     is_active = Column(Boolean, default=True, nullable=False)
     frame_rate = Column(Integer, default=5, nullable=False)
-    resolution_width = Column(Integer, default=1920, nullable=False)
-    resolution_height = Column(Integer, default=1080, nullable=False)
+    resolution_width = Column(Integer, default=2560, nullable=False)
+    resolution_height = Column(Integer, default=1440, nullable=False)
     
     # Location
     location = Column(String(255), nullable=True)

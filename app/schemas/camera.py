@@ -15,8 +15,8 @@ class CameraBase(BaseModel):
     username: Optional[str] = Field(None, max_length=100, description="RTSP username")
     password: Optional[str] = Field(None, max_length=255, description="RTSP password")
     frame_rate: int = Field(default=5, ge=1, le=60, description="Frame rate for processing")
-    resolution_width: int = Field(default=1920, ge=640, le=3840, description="Camera resolution width")
-    resolution_height: int = Field(default=1080, ge=480, le=2160, description="Camera resolution height")
+    resolution_width: int = Field(default=2560, ge=640, le=3840, description="Camera resolution width")
+    resolution_height: int = Field(default=1440, ge=480, le=2160, description="Camera resolution height")
     location: Optional[str] = Field(None, max_length=255, description="Camera location")
     settings: Optional[Dict[str, Any]] = Field(None, description="Additional camera settings")
 

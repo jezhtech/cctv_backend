@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     
     # Face Recognition
     FACE_DETECTION_CONFIDENCE: float = 0.6
-    FACE_RECOGNITION_THRESHOLD: float = 0.85  # Made much stricter (85%) to prevent false recognition
+    FACE_RECOGNITION_THRESHOLD: float = 0.5  # More lenient threshold (50%) for face recognition
     MAX_FACES_PER_IMAGE: int = 10
     
     # Logging

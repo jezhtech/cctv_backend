@@ -1,5 +1,6 @@
-"""Face recognition service using MTCNN for detection and VGG for recognition."""
+"""Lightweight face recognition service using face_recognition library."""
 import cv2
+import face_recognition
 import numpy as np
 import base64
 import time
@@ -9,11 +10,8 @@ from sqlalchemy import and_
 from loguru import logger
 import uuid
 from datetime import datetime, timedelta
-import tensorflow as tf
-from mtcnn import MTCNN
-import faiss
-import pickle
 import os
+from collections import defaultdict
 
 from app.models.database.user import User, FaceEmbedding, FaceDetection, Attendance
 from app.schemas.user import FaceRecognitionRequest, FaceUploadRequest
@@ -21,100 +19,39 @@ from app.core.config import settings
 
 
 class FaceRecognitionService:
-    """Service for face detection and recognition using MTCNN + VGG."""
+    """Lightweight service for face detection and recognition using face_recognition library."""
     
     def __init__(self):
-        self.mtcnn_detector = None
-        self.vgg_model = None
-        self.face_index = None
-        self.face_embeddings = {}
-        self.user_embeddings = {}
+        self.known_face_encodings = []
+        self.known_face_user_ids = []
+        self.known_face_names = []
+        self.cooldown_track = defaultdict(float)
+        self.COOLDOWN_SECONDS = 120  # 2 minutes cooldown between attendance marks
         self.is_initialized = False
-        self.initialization_lock = False
-        self._log_performance = False  # Performance logging flag - disabled for production
+        self.face_recognition_tolerance = 0.5  # Lower = stricter matching
         
-        # Initialize MTCNN detector and VGG model
-        self._initialize_models()
+        # Initialize the service
+        self._initialize_service()
     
-    def _initialize_models(self):
-        """Initialize MTCNN detector and VGG model."""
+    def _initialize_service(self):
+        """Initialize the face recognition service."""
         try:
-            if self.initialization_lock:
-                return
+            logger.info("Initializing lightweight face recognition service...")
             
-            self.initialization_lock = True
-            logger.info("Initializing MTCNN detector and VGG model...")
+            # Set tolerance based on settings
+            if hasattr(settings, 'FACE_RECOGNITION_THRESHOLD'):
+                # Map our threshold (0-1, higher = stricter) to face_recognition tolerance (lower = stricter)
+                # Our threshold 0.6 (60%) should map to tolerance 0.6 (more lenient)
+                # Our threshold 0.8 (80%) should map to tolerance 0.4 (more strict)
+                self.face_recognition_tolerance = max(0.3, min(0.7, 1.0 - settings.FACE_RECOGNITION_THRESHOLD))
             
-            # Initialize MTCNN for face detection with Metal GPU acceleration
-            # Optimized for multiple face detection with stricter parameters
-            self.mtcnn_detector = MTCNN(
-                stages='face_and_landmarks_detection',
-                device='GPU:0'  # Use Metal GPU for faster detection
-            )
-            
-            # Load VGG-Face model for face recognition with Metal GPU acceleration
-            self.vgg_model = tf.keras.applications.VGG16(
-                include_top=False,
-                weights='imagenet',
-                input_shape=(224, 224, 3),
-                pooling='avg'
-            )
-            
-            # Configure TensorFlow to use Metal GPU
-            try:
-                # Check if Metal GPU is available
-                gpus = tf.config.list_physical_devices('GPU')
-                if gpus:
-                    logger.info(f"Found {len(gpus)} GPU(s): {gpus}")
-                    # Note: Memory growth is automatically handled by tensorflow-metal
-                    logger.info("Metal GPU acceleration enabled for VGG model")
-                else:
-                    logger.warning("No Metal GPU found, falling back to CPU")
-            except Exception as e:
-                logger.warning(f"Could not configure Metal GPU: {str(e)}, falling back to CPU")
-            
-            logger.info("MTCNN detector and VGG model initialized successfully")
-            
-            # Log Metal GPU performance information
-            self._log_gpu_performance_info()
+            logger.info(f"Face recognition tolerance set to: {self.face_recognition_tolerance}")
+            self.is_initialized = True
+            logger.info("Lightweight face recognition service initialized successfully")
             
         except Exception as e:
-            logger.error(f"Failed to initialize MTCNN/VGG models: {str(e)}")
+            logger.error(f"Failed to initialize face recognition service: {str(e)}")
             self.is_initialized = False
-        finally:
-            self.initialization_lock = False
-    
-    def _log_gpu_performance_info(self):
-        """Log Metal GPU performance and configuration information."""
-        try:
-            # Check TensorFlow GPU availability
-            gpus = tf.config.list_physical_devices('GPU')
-            if gpus:
-                logger.info(f"✅ Metal GPU Acceleration: {len(gpus)} GPU(s) available")
-                for i, gpu in enumerate(gpus):
-                    logger.info(f"   GPU {i}: {gpu.name}")
-                
-                # Check if Metal is being used
-                try:
-                    # Test GPU computation
-                    with tf.device('/GPU:0'):
-                        test_tensor = tf.constant([1.0, 2.0, 3.0])
-                        result = tf.reduce_sum(test_tensor)
-                        logger.info(f"✅ Metal GPU computation test successful: {result.numpy()}")
-                except Exception as e:
-                    logger.warning(f"⚠️ Metal GPU computation test failed: {str(e)}")
-                    
-            else:
-                logger.warning("⚠️ No Metal GPU found - using CPU fallback")
-            
-            # Log MTCNN configuration for multiple face detection
-            logger.info(f"🔍 MTCNN Configuration:")
-            logger.info(f"   - stages: face_and_landmarks_detection")
-            logger.info(f"   - device: GPU:0 (Metal acceleration)")
-            logger.info(f"   - optimized for multiple face detection")
-                
-        except Exception as e:
-            logger.warning(f"Could not check GPU performance: {str(e)}")
     
     def _load_face_embeddings(self, db: Session):
         """Load face embeddings from database into memory."""
@@ -124,39 +61,39 @@ class FaceRecognitionService:
             
             logger.info("Loading face embeddings from database...")
             
+            # Clear existing data
+            self.known_face_encodings.clear()
+            self.known_face_user_ids.clear()
+            self.known_face_names.clear()
+            
             # Get all face embeddings
             embeddings = db.query(FaceEmbedding).filter(
-                FaceEmbedding.confidence_score >= settings.FACE_RECOGNITION_THRESHOLD
+                FaceEmbedding.confidence_score >= 0.5  # Basic quality filter
             ).all()
             
             if not embeddings:
                 logger.info("No face embeddings found in database")
                 return
             
-            # Build FAISS index for COSINE SIMILARITY (normalized vectors)
-            embedding_dim = 512  # VGG16 embedding dimension (avg pooling)
-            self.face_index = faiss.IndexFlatIP(embedding_dim)  # Inner product for normalized vectors = cosine similarity
-            
-            # Store embeddings and build index
+            # Load embeddings into memory
             for embedding in embeddings:
-                embedding_vector = np.frombuffer(
-                    base64.b64decode(embedding.embedding), 
-                    dtype=np.float32
-                )
-                
-                # NORMALIZE the embedding vector to unit length for cosine similarity
-                embedding_norm = np.linalg.norm(embedding_vector)
-                if embedding_norm > 0:
-                    embedding_vector = embedding_vector / embedding_norm
-                else:
-                    logger.warning(f"⚠️ Zero norm embedding found, skipping")
+                try:
+                    # Decode base64 embedding
+                    embedding_bytes = base64.b64decode(embedding.embedding)
+                    face_encoding = np.frombuffer(embedding_bytes, dtype=np.float64)
+                    
+                    # Get user information
+                    user = db.query(User).filter(User.id == embedding.user_id).first()
+                    if user:
+                        self.known_face_encodings.append(face_encoding)
+                        self.known_face_user_ids.append(embedding.user_id)
+                        self.known_face_names.append(user.full_name or f"User {embedding.user_id}")
+                        
+                except Exception as e:
+                    logger.warning(f"Failed to load embedding {embedding.id}: {str(e)}")
                     continue
-                
-                self.face_index.add(embedding_vector.reshape(1, -1))
-                self.face_embeddings[len(self.face_embeddings)] = embedding.id
-                self.user_embeddings[embedding.id] = embedding.user_id
             
-            logger.info(f"Loaded {len(embeddings)} face embeddings into memory")
+            logger.info(f"Loaded {len(self.known_face_encodings)} face embeddings into memory")
             
         except Exception as e:
             logger.error(f"Failed to load face embeddings: {str(e)}")
@@ -182,99 +119,54 @@ class FaceRecognitionService:
             return None
     
     def _extract_face_embeddings(self, image: np.ndarray) -> List[Dict[str, Any]]:
-        """Extract face embeddings from image using MTCNN + VGG."""
+        """Extract face embeddings from image using face_recognition library."""
         try:
             if not self.is_initialized:
                 return []
             
-            # Convert BGR to RGB (MTCNN expects RGB)
+            # Convert BGR to RGB (face_recognition expects RGB)
             rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             
-            # Detect faces using MTCNN
-            faces = self.mtcnn_detector.detect_faces(rgb_image)
+            # Detect face locations
+            face_locations = face_recognition.face_locations(rgb_image)
+            
+            if not face_locations:
+                return []
+            
+            # Get face encodings
+            face_encodings = face_recognition.face_encodings(rgb_image, face_locations)
             
             results = []
-            for face in faces:
-                confidence = face['confidence']
-                if confidence >= settings.FACE_DETECTION_CONFIDENCE:
-                    # Get bounding box
-                    x, y, w, h = face['box']
-                    face_bbox = {
-                        "x": int(x),
-                        "y": int(y),
-                        "width": int(w),
-                        "height": int(h)
+            for i, (face_encoding, face_location) in enumerate(zip(face_encodings, face_locations)):
+                try:
+                    # Convert face_recognition format to our format
+                    top, right, bottom, left = face_location
+                    
+                    bbox = {
+                        "x": int(left),
+                        "y": int(top),
+                        "width": int(right - left),
+                        "height": int(bottom - top)
                     }
                     
-                    # Get landmarks (eyes, nose, mouth corners)
-                    landmarks = face.get('keypoints', {})
-                    landmarks_list = []
-                    if landmarks:
-                        # Convert landmarks to list format
-                        for key in ['left_eye', 'right_eye', 'nose', 'mouth_left', 'mouth_right']:
-                            if key in landmarks:
-                                landmarks_list.append(landmarks[key])
-                    
-                    # Extract face region and generate embedding using VGG
-                    face_region = image[y:y+h, x:x+w]
-                    if face_region.size > 0:
-                        # Resize to VGG input size (224x224)
-                        face_resized = cv2.resize(face_region, (224, 224))
-                        
-                        # Preprocess for VGG (normalize and expand dimensions)
-                        face_normalized = face_resized.astype(np.float32) / 255.0
-                        face_batch = np.expand_dims(face_normalized, axis=0)
-                        
-                        # Generate embedding using VGG with Metal GPU optimization
-                        start_time = time.time()
-                        try:
-                            # Use TensorFlow's optimized Metal GPU inference
-                            with tf.device('/GPU:0'):
-                                embedding = self.vgg_model.predict(face_batch, verbose=0)
-                            embedding = embedding.flatten()  # Flatten to 1D array
-                            inference_time = (time.time() - start_time) * 1000  # Convert to milliseconds
-                            
-                            # Only log performance metrics occasionally to reduce overhead
-                            if hasattr(self, '_log_performance') and self._log_performance:
-                                logger.debug(f"🚀 Metal GPU inference: {inference_time:.2f}ms")
-                                
-                                # Log GPU memory usage if available
-                                try:
-                                    gpu_memory = tf.config.experimental.get_memory_info('/GPU:0')
-                                    logger.debug(f"GPU Memory - Current: {gpu_memory['current'] / 1024**2:.1f}MB, Peak: {gpu_memory['peak'] / 1024**2:.1f}MB")
-                                except:
-                                    pass
-                                
-                        except Exception as e:
-                            # Fallback to CPU if GPU fails
-                            logger.debug(f"GPU inference failed, falling back to CPU: {str(e)}")
-                            embedding = self.vgg_model.predict(face_batch, verbose=0)
-                            embedding = embedding.flatten()  # Flatten to 1D array
-                            inference_time = (time.time() - start_time) * 1000  # Convert to milliseconds
-                            
-                            if hasattr(self, '_log_performance') and self._log_performance:
-                                logger.debug(f"🐌 CPU fallback inference: {inference_time:.2f}ms")
-                    
                     # Calculate quality score
-                    quality_score = self._calculate_face_quality(image, face_bbox)
-                    
-                    # Calculate additional metrics
-                    face_size = {"width": face_bbox["width"], "height": face_bbox["height"]}
-                    face_angle = self._calculate_face_angle(face_bbox, landmarks_list)
-                    lighting_score = self._calculate_lighting_score(image, face_bbox)
-                    blur_score = self._calculate_blur_score(image, face_bbox)
+                    quality_score = self._calculate_face_quality(image, bbox)
                     
                     results.append({
-                        "embedding": embedding,
+                        "embedding": face_encoding,
                         "quality_score": quality_score,
-                        "bbox": face_bbox,
-                        "landmarks": landmarks_list,
-                        "confidence": float(confidence),
-                        "size": face_size,
-                        "angle": face_angle,
-                        "lighting_score": lighting_score,
-                        "blur_score": blur_score
+                        "bbox": bbox,
+                        "landmarks": [],  # face_recognition doesn't provide landmarks
+                        "confidence": 0.9,  # High confidence for face_recognition
+                        "size": {"width": bbox["width"], "height": bbox["height"]},
+                        "angle": 0.0,  # Not calculated
+                        "lighting_score": self._calculate_lighting_score(image, bbox),
+                        "blur_score": self._calculate_blur_score(image, bbox)
                     })
+                    
+                except Exception as e:
+                    logger.warning(f"Failed to process face {i}: {str(e)}")
+                    continue
             
             return results
             
@@ -313,36 +205,6 @@ class FaceRecognitionService:
             
         except Exception as e:
             logger.error(f"Failed to calculate face quality: {str(e)}")
-            return 0.0
-    
-    def _calculate_face_angle(self, bbox: Dict[str, int], landmarks: List[List[int]]) -> float:
-        """Calculate face angle/orientation based on landmarks."""
-        try:
-            if not landmarks or len(landmarks) < 5:
-                return 0.0
-            
-            # Use eye landmarks to calculate face angle
-            # Assuming landmarks[0] and landmarks[1] are left and right eye centers
-            if len(landmarks) >= 2:
-                left_eye = np.array(landmarks[0])
-                right_eye = np.array(landmarks[1])
-                
-                # Calculate angle between eyes
-                eye_vector = right_eye - left_eye
-                angle = np.arctan2(eye_vector[1], eye_vector[0]) * 180 / np.pi
-                
-                # Normalize to -90 to 90 degrees
-                if angle > 90:
-                    angle -= 180
-                elif angle < -90:
-                    angle += 180
-                
-                return float(angle)
-            
-            return 0.0
-            
-        except Exception as e:
-            logger.error(f"Failed to calculate face angle: {str(e)}")
             return 0.0
     
     def _calculate_lighting_score(self, image: np.ndarray, bbox: Dict[str, int]) -> float:
@@ -415,62 +277,36 @@ class FaceRecognitionService:
         else:
             return value
     
-    def _find_similar_faces(self, query_embedding: np.ndarray, threshold: float = None) -> List[Tuple[int, float]]:
-        """Find similar faces using FAISS index."""
+    def _find_similar_faces(self, query_encoding: np.ndarray, threshold: float = None) -> List[Tuple[int, float]]:
+        """Find similar faces using face_recognition library."""
         try:
-            if self.face_index is None or len(self.face_embeddings) == 0:
+            if not self.known_face_encodings:
                 return []
             
             threshold = threshold or settings.FACE_RECOGNITION_THRESHOLD
             
-            # Search for similar embeddings
-            query_vector = query_embedding.reshape(1, -1)
+            # Use face_recognition's compare_faces with tolerance
+            matches = face_recognition.compare_faces(
+                self.known_face_encodings, 
+                query_encoding, 
+                tolerance=self.face_recognition_tolerance
+            )
             
-            # NORMALIZE the query vector to unit length for cosine similarity
-            query_norm = np.linalg.norm(query_vector)
-            if query_norm > 0:
-                query_vector = query_vector / query_norm
-            else:
-                logger.warning(f"⚠️ Zero norm query embedding, cannot compute similarity")
-                return []
-            
-            similarities, indices = self.face_index.search(query_vector, k=min(10, len(self.face_embeddings)))
-            
-            # Track best match per user to avoid duplicate user matches
-            best_per_user = {}
-            
-            for i, (similarity, idx) in enumerate(zip(similarities[0], indices[0])):
-                # Validate similarity score - should be between -1 and 1 for cosine similarity
-                if similarity > 1.0:
-                    logger.warning(f"⚠️ Invalid similarity score {similarity:.3f} > 1.0, capping at 1.0")
-                    similarity = 1.0
-                elif similarity < -1.0:
-                    logger.warning(f"⚠️ Invalid similarity score {similarity:.3f} < -1.0, capping at -1.0")
-                    similarity = -1.0
-                
-                # Convert cosine similarity to positive scale (0 to 1) for easier thresholding
-                # Cosine similarity ranges from -1 (opposite) to 1 (same), we want 0 (different) to 1 (same)
-                normalized_similarity = (similarity + 1.0) / 2.0  # Convert from [-1,1] to [0,1]
-                
-                if normalized_similarity >= threshold and idx < len(self.face_embeddings):
-                    embedding_id = self.face_embeddings[idx]
-                    user_id = self.user_embeddings.get(embedding_id)
+            results = []
+            for i, is_match in enumerate(matches):
+                if is_match:
+                    # Calculate distance for confidence score
+                    distance = face_recognition.face_distance([self.known_face_encodings[i]], query_encoding)[0]
                     
-                    if user_id:
-                        # Keep only the best match per user
-                        if user_id not in best_per_user or normalized_similarity > best_per_user[user_id][1]:
-                            best_per_user[user_id] = (embedding_id, float(normalized_similarity))
+                    # Convert distance to similarity score (0-1, higher is better)
+                    # face_recognition distance is typically 0.0-1.0, where 0.0 is perfect match
+                    similarity_score = max(0.0, 1.0 - distance)
+                    
+                    if similarity_score >= threshold:
+                        results.append((i, float(similarity_score)))
             
-            # Return results sorted by similarity (best first)
-            results = list(best_per_user.values())
+            # Sort by similarity (best first)
             results.sort(key=lambda x: x[1], reverse=True)
-            
-            # Add additional logging to debug face matching
-            if results:
-                logger.debug(f"Face recognition results: {len(results)} matches found")
-                for i, (embedding_id, similarity) in enumerate(results):
-                    user_id = self.user_embeddings.get(embedding_id)
-                    logger.debug(f"  Match {i+1}: User {user_id}, Normalized Similarity: {similarity:.3f}")
             
             return results
             
@@ -525,8 +361,9 @@ class FaceRecognitionService:
                 }
             
             # Get best match
-            best_match_id, confidence_score = similar_faces[0]
-            user_id = self.user_embeddings.get(best_match_id)
+            best_match_index, confidence_score = similar_faces[0]
+            user_id = self.known_face_user_ids[best_match_index]
+            user_name = self.known_face_names[best_match_index]
             
             if not user_id:
                 return {
@@ -610,7 +447,7 @@ class FaceRecognitionService:
                     "processing_time_ms": 0
                 }
             
-            # Process all detected faces (support multiple faces)
+            # Process all detected faces
             created_embeddings = []
             primary_face_processed = False
             
@@ -621,20 +458,16 @@ class FaceRecognitionService:
                     embedding_b64 = base64.b64encode(embedding_bytes).decode('utf-8')
                     
                     # Use the actual uploaded image URL from our storage
-                    # The image is already saved in uploads/users/ directory
-                    # We'll construct the URL based on the source description
                     if request.source_description and "Profile image:" in request.source_description:
-                        # Extract filename from source description (e.g., "Profile image: img_001_1703123456789_a1b2c3")
                         filename = request.source_description.split("Profile image: ")[-1]
                         face_image_url = f"/uploads/users/{filename}"
                     else:
-                        # Fallback for other sources
                         face_image_url = f"/uploads/faces/{request.user_id}/{uuid.uuid4()}.jpg"
                     
-                    # Determine if this should be primary (first face or explicitly marked)
+                    # Determine if this should be primary
                     is_primary = (i == 0 and request.is_primary) or (i == 0 and not primary_face_processed)
                     
-                    # Create face embedding record with all numpy types converted to native Python types
+                    # Create face embedding record
                     face_embedding = FaceEmbedding(
                         user_id=request.user_id,
                         embedding=embedding_b64,
@@ -645,7 +478,6 @@ class FaceRecognitionService:
                         landmarks=self._convert_numpy_types(face["landmarks"]),
                         source_image=f"{request.source_description} (Face {i+1})",
                         is_primary=is_primary,
-                        # Add new quality metrics - convert numpy types to native Python types
                         face_size=self._convert_numpy_types(face.get("size", {"width": 0, "height": 0})),
                         face_angle=self._convert_numpy_types(face.get("angle", 0.0)),
                         lighting_score=self._convert_numpy_types(face.get("lighting_score", 0.0)),
@@ -663,9 +495,8 @@ class FaceRecognitionService:
                         primary_face_processed = True
                     
                     db.add(face_embedding)
-                    db.flush()  # Flush to get the ID
+                    db.flush()
                     
-                    # Add to created embeddings list
                     created_embeddings.append({
                         "id": str(face_embedding.id),
                         "confidence_score": face_embedding.confidence_score,
@@ -690,7 +521,7 @@ class FaceRecognitionService:
             if created_embeddings:
                 return {
                     "success": True,
-                    "face_embedding_id": created_embeddings[0]["id"],  # Return first one for backward compatibility
+                    "face_embedding_id": created_embeddings[0]["id"],
                     "confidence_score": created_embeddings[0]["confidence_score"],
                     "face_quality_score": created_embeddings[0]["face_quality_score"],
                     "message": f"Successfully processed {len(created_embeddings)} faces from image",
@@ -761,6 +592,24 @@ class FaceRecognitionService:
         except Exception as e:
             logger.error(f"Failed to cleanup old detections: {str(e)}")
             db.rollback()
+    
+    def check_attendance_cooldown(self, user_name: str, camera_id: str) -> bool:
+        """Check if attendance can be marked (cooldown period)."""
+        try:
+            now = time.time()
+            key = (user_name, camera_id)
+            
+            if now - self.cooldown_track[key] > self.COOLDOWN_SECONDS:
+                self.cooldown_track[key] = now
+                return True  # Can mark attendance
+            else:
+                remaining = self.COOLDOWN_SECONDS - (now - self.cooldown_track[key])
+                logger.info(f"COOLDOWN: {user_name} recently marked on {camera_id}, {remaining:.1f}s remaining")
+                return False  # Cannot mark attendance yet
+                
+        except Exception as e:
+            logger.error(f"Error checking attendance cooldown: {str(e)}")
+            return True  # Default to allowing attendance if check fails
 
 
 # Global face recognition service instance

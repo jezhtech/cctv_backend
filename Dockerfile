@@ -10,7 +10,7 @@ ENV PYTHONUNBUFFERED=1 \
 # Set work directory
 WORKDIR /app
 
-# Install system dependencies including OpenCV requirements
+# Install system dependencies including face_recognition requirements
 RUN apt-get update && apt-get install -y \
     gcc \
     g++ \
@@ -20,6 +20,14 @@ RUN apt-get update && apt-get install -y \
     libtiff-dev \
     python3-dev \
     curl \
+    # face_recognition and dlib dependencies
+    cmake \
+    libopenblas-dev \
+    liblapack-dev \
+    libx11-dev \
+    libgtk-3-dev \
+    libboost-python-dev \
+    libboost-thread-dev \
     # OpenCV dependencies
     libgl1 \
     libglib2.0-0 \
