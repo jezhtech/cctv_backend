@@ -4,10 +4,10 @@ from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import UUID
 import uuid
 
-from .base import Base, TimestampMixin, SoftDeleteMixin
+from .base import Base, TimestampMixin
 
 
-class User(Base, TimestampMixin, SoftDeleteMixin):
+class User(Base, TimestampMixin):
     """User model for storing user information."""
     
     __tablename__ = "users"

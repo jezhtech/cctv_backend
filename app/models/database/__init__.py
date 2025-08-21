@@ -1,7 +1,7 @@
 """Database models package."""
 
 # Import models in the correct order to avoid circular dependencies
-from .base import Base, TimestampMixin, SoftDeleteMixin
+from .base import Base, TimestampMixin
 
 # Import Camera model first (it has no dependencies on other models)
 from .camera import Camera, CameraStream
@@ -16,7 +16,6 @@ from .user import Attendance, FaceDetection
 __all__ = [
     "Base",
     "TimestampMixin", 
-    "SoftDeleteMixin",
     "Camera",
     "CameraStream",
     "User",

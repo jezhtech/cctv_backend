@@ -4,10 +4,10 @@ from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import UUID
 import uuid
 
-from .base import Base, TimestampMixin, SoftDeleteMixin
+from .base import Base, TimestampMixin
 
 
-class Camera(Base, TimestampMixin, SoftDeleteMixin):
+class Camera(Base, TimestampMixin):
     """Camera model for storing RTSP camera information."""
     
     __tablename__ = "cameras"

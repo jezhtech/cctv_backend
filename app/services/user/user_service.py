@@ -66,9 +66,7 @@ class UserService:
     async def get_user(self, db: Session, user_id: uuid.UUID) -> Optional[User]:
         """Get user by ID."""
         try:
-            user = db.query(User).filter(
-                and_(User.id == user_id, User.is_deleted == False)
-            ).first()
+            user = db.query(User).filter(User.id == user_id).first()
             return user
         except Exception as e:
             logger.error(f"Failed to get user {user_id}: {str(e)}")
@@ -83,7 +81,7 @@ class UserService:
     ) -> Tuple[List[User], int]:
         """Get paginated list of users."""
         try:
-            query = db.query(User).filter(User.is_deleted == False)
+            query = db.query(User)
             
             if active_only:
                 query = query.filter(User.is_active == True)
@@ -142,19 +140,16 @@ class UserService:
             raise
     
     async def delete_user(self, db: Session, user_id: uuid.UUID) -> bool:
-        """Soft delete user."""
+        """Hard delete user permanently."""
         try:
             user = await self.get_user(db, user_id)
             if not user:
                 return False
             
-            # Soft delete
-            user.is_deleted = True
-            user.deleted_at = datetime.utcnow()
-            user.is_active = False
-            
+            # Hard delete - permanently remove from database
+            db.delete(user)
             db.commit()
-            logger.info(f"User deleted successfully: {user_id}")
+            logger.info(f"User permanently deleted: {user_id}")
             return True
             
         except Exception as e:

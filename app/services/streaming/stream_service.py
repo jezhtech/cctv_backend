@@ -7,7 +7,7 @@ import uuid
 import numpy as np
 import math
 from loguru import logger
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List
 
 from app.core.config import settings
@@ -94,8 +94,8 @@ class StreamProcessor:
             'last_recognition_time': None,
             'recognition_accuracy': 0.0,
             'detection_history': [],
-            'active_faces': {},  # Track active faces to prevent duplicates
-            'face_tracking_timeout': 5.0  # Seconds to consider a face as "new"
+            'currently_present_faces': {},  # Track faces currently in camera view: {face_id: face_info}
+            'duplicate_prevention_distance': settings.FACE_DUPLICATE_PREVENTION_DISTANCE  # Pixels distance to consider faces as the same person
         }
     
     async def start_async(self):
@@ -121,6 +121,8 @@ class StreamProcessor:
             self.is_running = True
             self._stop_event.clear()
             self.task = asyncio.create_task(self._process_stream_async())
+            
+            
             
             self.start_time = datetime.utcnow()
             logger.info(f"Started FastAPI stream processor for camera {self.camera_id}")
@@ -148,6 +150,8 @@ class StreamProcessor:
                     await self.task
                 except asyncio.CancelledError:
                     pass
+            
+
             
             if self.cap:
                 self.cap.release()
@@ -517,9 +521,12 @@ class StreamProcessor:
             face_locations = self.last_face_locations
             face_labels = self.last_face_labels
             
-            # Process detected faces with attendance tracking
+            # Process detected faces with proper sequential tracking and cleanup
             new_faces_count = 0
+            current_faces = set()  # Track faces detected in current frame
+            current_time = datetime.utcnow()
             
+            # Step 1: Process all detected faces and update tracking
             for i, (face_location, face_label) in enumerate(zip(face_locations, face_labels)):
                 try:
                     # Convert face_recognition format to our bbox format
@@ -531,48 +538,124 @@ class StreamProcessor:
                         "height": int(bottom - top)
                     }
                     
-                    # Check if this is a known face
-                    if face_label != "UNKNOWN":
-                        # Check attendance cooldown
-                        if face_recognition_service.check_attendance_cooldown(face_label, str(self.camera_id)):
-                            # Mark attendance
-                            logger.info(f"Camera {self.camera_id}: Marking attendance for {face_label}")
-                            # TODO: Add your attendance marking logic here
-                        
-                        # Update recognition metrics
-                        self.face_detection_metrics['total_faces_recognized'] += 1
-                        self.face_detection_metrics['last_recognition_time'] = datetime.utcnow()
-                        
-                        # Add to detection history
-                        self.face_detection_metrics['detection_history'].append({
-                            'timestamp': datetime.utcnow().isoformat(),
-                            'user_name': face_label,
-                            'confidence': 0.9,  # High confidence for known faces
-                            'bbox': bbox
-                        })
-                        
-                        # Keep only last 100 detections in history
-                        if len(self.face_detection_metrics['detection_history']) > 100:
-                            self.face_detection_metrics['detection_history'].pop(0)
-                        
-                        new_faces_count += 1
-                        logger.info(f"Camera {self.camera_id}: Recognized {face_label} at {bbox}")
-                    else:
-                        # Unknown face
-                        new_faces_count += 1
-                        logger.debug(f"Camera {self.camera_id}: Unknown face detected at {bbox}")
+                    face_center = (int(left + (right - left) // 2), int(top + (bottom - top) // 2))
+                    is_existing_face = False
+                    existing_face_id = None
                     
-                    # Store face detection in database
-                    await self._store_face_detection_simple(frame, bbox, face_label)
+                    # Check if this face is already being tracked
+                    for face_id, face_info in self.face_detection_metrics['currently_present_faces'].items():
+                        # Check if centers are close (within configured distance for same person)
+                        existing_center = face_info['center']
+                        distance = ((face_center[0] - existing_center[0])**2 + (face_center[1] - existing_center[1])**2)**0.5
+                        
+                        if distance < self.face_detection_metrics['duplicate_prevention_distance']:
+                            # This is the same person - update tracking
+                            is_existing_face = True
+                            existing_face_id = face_id
+                            
+                            # Update existing face tracking
+                            face_info['center'] = face_center
+                            face_info['bbox'] = bbox
+                            face_info['last_seen'] = current_time
+                            
+                            # Update user info if this is a known face
+                            if face_label != "UNKNOWN":
+                                face_info['user_name'] = face_label
+                                face_info['confidence'] = 0.9
+                            
+                            # Mark this face as still present
+                            current_faces.add(face_id)
+                            
+                            logger.debug(f"Camera {self.camera_id}: Updated existing face tracking (ID: {face_id}) for {face_label}")
+                            break
+                    
+                    # Only process new faces (not already tracked)
+                    if not is_existing_face:
+                        if face_label != "UNKNOWN":
+                            # Check attendance cooldown
+                            if face_recognition_service.check_attendance_cooldown(face_label, str(self.camera_id)):
+                                # Mark attendance
+                                logger.info(f"Camera {self.camera_id}: Marking attendance for {face_label}")
+                                # TODO: Add your attendance marking logic here
+                            
+                            # Update recognition metrics
+                            self.face_detection_metrics['total_faces_recognized'] += 1
+                            self.face_detection_metrics['last_recognition_time'] = datetime.utcnow()
+                            
+                            # Add to detection history only for new detections
+                            self.face_detection_metrics['detection_history'].append({
+                                'timestamp': datetime.utcnow().isoformat(),
+                                'user_name': face_label,
+                                'confidence': 0.9,  # High confidence for known faces
+                                'bbox': bbox
+                            })
+                            
+                            # Keep only last 100 detections in history
+                            if len(self.face_detection_metrics['detection_history']) > 100:
+                                self.face_detection_metrics['detection_history'].pop(0)
+                            
+                            new_faces_count += 1
+                            logger.info(f"Camera {self.camera_id}: New recognition of {face_label} at {bbox}")
+                        else:
+                            # Unknown face
+                            new_faces_count += 1
+                            logger.debug(f"Camera {self.camera_id}: New unknown face detected at {bbox}")
+                        
+                        # IMPORTANT: Check if face already exists in database before storing
+                        # This prevents duplicate database entries
+                        if not await self._face_already_exists_in_db(face_label, bbox):
+                            # Store face detection in database only for new detections
+                            await self._store_face_detection_simple(frame, bbox, face_label)
+                            logger.debug(f"Camera {self.camera_id}: Stored new face detection in database for {face_label}")
+                        else:
+                            logger.debug(f"Camera {self.camera_id}: Face {face_label} already exists in database - skipping storage")
+                        
+                        # Add new face to tracking
+                        face_id = str(uuid.uuid4())
+                        self.face_detection_metrics['currently_present_faces'][face_id] = {
+                            'center': face_center,
+                            'bbox': bbox,
+                            'first_seen': current_time,
+                            'last_seen': current_time,
+                            'user_name': face_label if face_label != "UNKNOWN" else "Unknown",
+                            'confidence': 0.9 if face_label != "UNKNOWN" else 0.0
+                        }
+                        
+                        # Mark this face as present
+                        current_faces.add(face_id)
+                        
+                        logger.debug(f"Camera {self.camera_id}: Added new face to tracking (ID: {face_id}) for {face_label}")
+                    else:
+                        # Existing face - just log the update
+                        logger.debug(f"Camera {self.camera_id}: Face {face_label} already tracked (ID: {existing_face_id}) - skipping duplicate detection")
                     
                 except Exception as e:
                     logger.error(f"Camera {self.camera_id}: Error processing face {i}: {str(e)}")
                     continue
             
+            # Step 2: AFTER face recognition is complete, clean up faces no longer present
+            # This prevents race conditions and ensures proper sequential processing
+            faces_to_remove = []
+            for face_id in self.face_detection_metrics['currently_present_faces']:
+                if face_id not in current_faces:
+                    faces_to_remove.append(face_id)
+                    user_name = self.face_detection_metrics['currently_present_faces'][face_id].get('user_name', 'Unknown')
+                    logger.debug(f"Camera {self.camera_id}: Face {face_id} ({user_name}) no longer in camera view - marking for removal")
+            
+            # Remove faces that are no longer present
+            for face_id in faces_to_remove:
+                user_name = self.face_detection_metrics['currently_present_faces'][face_id].get('user_name', 'Unknown')
+                del self.face_detection_metrics['currently_present_faces'][face_id]
+                logger.info(f"Camera {self.camera_id}: Removed face {face_id} ({user_name}) from tracking - no longer present")
+            
             # Update face detection metrics
             if new_faces_count > 0:
                 self.face_detection_metrics['total_faces_detected'] += new_faces_count
-                logger.info(f"Camera {self.camera_id}: Processed {new_faces_count} faces in frame {self.frame_count}")
+                logger.info(f"Camera {self.camera_id}: Processed {new_faces_count} new faces in frame {self.frame_count}")
+            
+            # Log current tracking status
+            current_present_count = len(self.face_detection_metrics['currently_present_faces'])
+            logger.info(f"Camera {self.camera_id}: Frame {self.frame_count} - {current_present_count} faces currently present, {new_faces_count} new faces detected, {len(faces_to_remove)} faces removed")
             
         except Exception as e:
             logger.error(f"Error in face detection and recognition for camera {self.camera_id}: {str(e)}")
@@ -675,9 +758,9 @@ class StreamProcessor:
                     if len(self.face_detection_metrics['detection_history']) > 100:
                         self.face_detection_metrics['detection_history'].pop(0)
                     
-                    # Update the active face tracking with user information
-                    # Find which active face this detection corresponds to
-                    for face_id, face_info in self.face_detection_metrics['active_faces'].items():
+                    # Update the currently present face tracking with user information
+                    # Find which face this detection corresponds to
+                    for face_id, face_info in self.face_detection_metrics['currently_present_faces'].items():
                         if (face_info['bbox']['x'] == face["bbox"]["x"] and 
                             face_info['bbox']['y'] == face["bbox"]["y"] and
                             face_info['bbox']['width'] == face["bbox"]["width"] and
@@ -944,12 +1027,20 @@ class StreamProcessor:
             # Return recent detections from history
             recent_detections = self.face_detection_metrics['detection_history'][-limit:]
             
-            # Calculate current active faces count
-            current_time = time.time()
-            active_faces_count = len([
-                face_id for face_id, face_info in self.face_detection_metrics['active_faces'].items()
-                if current_time - face_info['last_seen'] <= self.face_detection_metrics['face_tracking_timeout']
-            ])
+            # Get currently present faces count and details
+            currently_present_faces = self.face_detection_metrics['currently_present_faces']
+            currently_present_count = len(currently_present_faces)
+            
+            # Get currently present faces details for monitoring
+            currently_present_details = []
+            for face_id, face_info in currently_present_faces.items():
+                currently_present_details.append({
+                    'id': face_id,
+                    'user_name': face_info.get('user_name', 'Unknown'),
+                    'last_seen': face_info.get('last_seen', datetime.utcnow()).isoformat() if face_info.get('last_seen') else None,
+                    'bbox': face_info.get('bbox', {}),
+                    'confidence': face_info.get('confidence', 0.0)
+                })
             
             # Add current metrics
             result = {
@@ -957,8 +1048,12 @@ class StreamProcessor:
                 "total_faces_detected": self.face_detection_metrics['total_faces_detected'],
                 "total_faces_recognized": self.face_detection_metrics['total_faces_recognized'],
                 "recognition_accuracy": round(self.face_detection_metrics['recognition_accuracy'], 3),
-                "active_faces_count": active_faces_count,
-                "last_recognition_time": self.face_detection_metrics['last_recognition_time'].isoformat() if self.face_detection_metrics['last_recognition_time'] else None
+                "currently_present_faces_count": currently_present_count,
+                "currently_present_faces_details": currently_present_details,
+                "last_recognition_time": self.face_detection_metrics['last_recognition_time'].isoformat() if self.face_detection_metrics['last_recognition_time'] else None,
+                "tracking_config": {
+                    "duplicate_prevention_distance": self.face_detection_metrics['duplicate_prevention_distance']
+                }
             }
             
             return result
@@ -970,9 +1065,126 @@ class StreamProcessor:
                 "total_faces_detected": 0,
                 "total_faces_recognized": 0,
                 "recognition_accuracy": 0.0,
-                "active_faces_count": 0,
-                "last_recognition_time": None
+                "currently_present_faces_count": 0,
+                "currently_present_faces_details": [],
+                "last_recognition_time": None,
+                "tracking_config": {
+                    "duplicate_prevention_distance": 50
+                }
             }
+    
+    def clear_face_tracking(self):
+        """Clear all face tracking data (useful for testing or resetting)."""
+        try:
+            self.face_detection_metrics['currently_present_faces'].clear()
+            logger.info(f"Camera {self.camera_id}: Cleared all face tracking data")
+        except Exception as e:
+            logger.error(f"Error clearing face tracking for camera {self.camera_id}: {str(e)}")
+    
+    async def _face_already_exists_in_db(self, face_label: str, bbox: Dict[str, int]) -> bool:
+        """Check if a face detection already exists in the database to prevent duplicates."""
+        try:
+            # Create database session
+            db = SessionLocal()
+            
+            try:
+                # Check for recent detections of the same person within a short time window
+                # This prevents duplicate database entries for the same person
+                current_time = datetime.utcnow()
+                time_threshold = current_time - timedelta(seconds=5)  # 5 second window
+                
+                # Query for recent detections
+                recent_detections = db.query(FaceDetection).filter(
+                    FaceDetection.camera_id == self.camera_id,
+                    FaceDetection.timestamp >= time_threshold.isoformat()
+                ).all()
+                
+                # Check if any recent detection matches this face
+                for detection in recent_detections:
+                    # Check if it's the same person (by name if known, or by location if unknown)
+                    if face_label != "UNKNOWN":
+                        # For known faces, check by name and time
+                        if (detection.recognized_user_id and 
+                            detection.recognition_confidence > 0.8 and
+                            abs((current_time - datetime.fromisoformat(detection.timestamp)).total_seconds()) < 5):
+                            logger.debug(f"Camera {self.camera_id}: Face {face_label} already detected recently in database")
+                            return True
+                    else:
+                        # For unknown faces, check by location similarity
+                        if detection.face_bbox:
+                            # Calculate if bounding boxes are close (same location)
+                            existing_bbox = detection.face_bbox
+                            if isinstance(existing_bbox, dict):
+                                center_distance = ((bbox['x'] - existing_bbox.get('x', 0))**2 + 
+                                                (bbox['y'] - existing_bbox.get('y', 0))**2)**0.5
+                                if center_distance < 100:  # Within 100 pixels
+                                    logger.debug(f"Camera {self.camera_id}: Unknown face at similar location already detected recently")
+                                    return True
+                
+                return False
+                
+            finally:
+                db.close()
+                
+        except Exception as e:
+            logger.error(f"Error checking if face exists in database: {str(e)}")
+            return False  # If error, assume it doesn't exist to be safe
+    
+    def force_face_cleanup(self):
+        """Manually trigger face cleanup (useful for testing)."""
+        try:
+            current_time = datetime.utcnow()
+            faces_to_remove = []
+            
+            for face_id, face_info in self.face_detection_metrics['currently_present_faces'].items():
+                last_seen = face_info.get('last_seen')
+                if last_seen:
+                    time_since_last_seen = (current_time - last_seen).total_seconds()
+                    if time_since_last_seen > 5.0:  # Use 5 seconds as threshold
+                        faces_to_remove.append(face_id)
+            
+            for face_id in faces_to_remove:
+                user_name = self.face_detection_metrics['currently_present_faces'][face_id].get('user_name', 'Unknown')
+                del self.face_detection_metrics['currently_present_faces'][face_id]
+                logger.info(f"Camera {self.camera_id}: Manually removed face {face_id} ({user_name}) from tracking")
+            
+            if faces_to_remove:
+                logger.info(f"Camera {self.camera_id}: Manually cleaned up {len(faces_to_remove)} absent faces")
+            else:
+                logger.info(f"Camera {self.camera_id}: No faces to clean up")
+                
+        except Exception as e:
+            logger.error(f"Error in manual face cleanup for camera {self.camera_id}: {str(e)}")
+    
+    def get_face_tracking_stats(self) -> Dict[str, Any]:
+        """Get detailed face tracking statistics."""
+        try:
+            currently_present_faces = self.face_detection_metrics['currently_present_faces']
+            currently_present_count = len(currently_present_faces)
+            
+            # Get currently present faces details
+            currently_present_details = []
+            for face_id, face_info in currently_present_faces.items():
+                currently_present_details.append({
+                    'id': face_id,
+                    'user_name': face_info.get('user_name', 'Unknown'),
+                    'last_seen': face_info.get('last_seen', datetime.utcnow()).isoformat() if face_info.get('last_seen') else None,
+                    'bbox': face_info.get('bbox', {}),
+                    'confidence': face_info.get('confidence', 0.0)
+                })
+            
+            return {
+                "currently_present_faces_count": currently_present_count,
+                "total_tracked_faces": currently_present_count,
+                "currently_present_faces": currently_present_details,
+                "tracking_config": {
+                    "duplicate_prevention_distance": self.face_detection_metrics['duplicate_prevention_distance']
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting face tracking stats for camera {self.camera_id}: {str(e)}")
+            return {}
     
     def get_frame_with_bounding_boxes(self) -> np.ndarray:
         """Get the latest frame with bounding boxes drawn around detected faces."""
@@ -1055,8 +1267,8 @@ class StreamProcessor:
             y_offset += line_height
             
             # Active faces currently visible
-            active_faces_count = len(self.last_face_locations) if self.last_face_locations else 0
-            cv2.putText(frame_with_boxes, f"Active Faces: {active_faces_count}", (20, y_offset), 
+            currently_present_faces_count = len(self.face_detection_metrics['currently_present_faces'])
+            cv2.putText(frame_with_boxes, f"Currently Present: {currently_present_faces_count}", (20, y_offset), 
                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             y_offset += line_height
             
@@ -1171,20 +1383,15 @@ class StreamProcessor:
             x, y, w, h = bbox['x'], bbox['y'], bbox['width'], bbox['height']
             face_center = (x + w//2, y + h//2)
             
-            # Check against active faces
-            for face_id, face_info in list(self.face_detection_metrics['active_faces'].items()):
-                # Remove expired faces
-                if current_time - face_info['last_seen'] > self.face_detection_metrics['face_tracking_timeout']:
-                    del self.face_detection_metrics['active_faces'][face_id]
-                    continue
-                
-                # Check if centers are close (within 50 pixels)
+            # Check against currently present faces
+            for face_id, face_info in self.face_detection_metrics['currently_present_faces'].items():
+                # Check if centers are close (within configured distance)
                 existing_center = face_info['center']
                 distance = ((face_center[0] - existing_center[0])**2 + (face_center[1] - existing_center[1])**2)**0.5
                 
-                if distance < 50:  # Same face if centers are within 50 pixels
+                if distance < self.face_detection_metrics['duplicate_prevention_distance']:  # Same face if centers are within configured distance
                     # Update last seen time
-                    self.face_detection_metrics['active_faces'][face_id]['last_seen'] = current_time
+                    face_info['last_seen'] = datetime.utcnow()
                     return True
             
             return False
@@ -1256,36 +1463,27 @@ class StreamProcessor:
             face_center = (x + w//2, y + h//2)
             
             # Check if this face is close to an existing tracked face
-            current_time = time.time()
-            for face_id, face_info in list(self.face_detection_metrics['active_faces'].items()):
-                # Remove expired faces
-                if current_time - face_info['last_seen'] > self.face_detection_metrics['face_tracking_timeout']:
-                    del self.face_detection_metrics['active_faces'][face_id]
-                    continue
-                
-                # Check if centers are close (within 100 pixels for same person)
+            for face_id, face_info in self.face_detection_metrics['currently_present_faces'].items():
+                # Check if centers are close (within configured distance for same person)
                 existing_center = face_info['center']
                 distance = ((face_center[0] - existing_center[0])**2 + (face_center[1] - existing_center[1])**2)**0.5
                 
-                if distance < 100:  # Same person if centers are within 100 pixels
+                if distance < self.face_detection_metrics['duplicate_prevention_distance']:
                     # Update existing face tracking
-                    face_info['last_seen'] = current_time
                     face_info['center'] = face_center  # Update position
                     face_info['bbox'] = bbox  # Update bounding box
-                    face_info['detection_count'] += 1
+                    face_info['last_seen'] = datetime.utcnow()
                     logger.debug(f"Camera {self.camera_id}: Updated existing face tracking (ID: {face_id})")
                     return face_id
             
             # Generate new face ID for truly new face
             face_id = str(uuid.uuid4())
             
-            self.face_detection_metrics['active_faces'][face_id] = {
+            self.face_detection_metrics['currently_present_faces'][face_id] = {
                 'center': face_center,
                 'bbox': bbox,
-                'first_seen': current_time,
-                'last_seen': current_time,
-                'detection_count': 1,
-                'user_id': None,
+                'first_seen': datetime.utcnow(),
+                'last_seen': datetime.utcnow(),
                 'user_name': "Unknown",
                 'confidence': 0.0
             }
@@ -1304,19 +1502,13 @@ class StreamProcessor:
             x, y, w, h = bbox['x'], bbox['y'], bbox['width'], bbox['height']
             face_center = (x + w//2, y + h//2)
             
-            current_time = time.time()
-            for face_id, face_info in list(self.face_detection_metrics['active_faces'].items()):
-                # Remove expired faces
-                if current_time - face_info['last_seen'] > self.face_detection_metrics['face_tracking_timeout']:
-                    del self.face_detection_metrics['active_faces'][face_id]
-                    continue
+            for face_id, face_info in self.face_detection_metrics['currently_present_faces'].items():
                 
-                # Check if centers are close (within 50 pixels for same person)
-                # Reduced from 100 to 50 pixels to be more strict about face matching
+                # Check if centers are close (within configured distance for same person)
                 existing_center = face_info['center']
                 distance = ((face_center[0] - existing_center[0])**2 + (face_center[1] - existing_center[1])**2)**0.5
                 
-                if distance < 50:  # Same person if centers are within 50 pixels (more strict)
+                if distance < self.face_detection_metrics['duplicate_prevention_distance']:  # Same person if centers are within configured distance
                     return face_id
             
             return None
@@ -1333,12 +1525,11 @@ class StreamProcessor:
             face_center = (x + w//2, y + h//2)
             current_time = time.time()
             
-            if face_id in self.face_detection_metrics['active_faces']:
-                face_info = self.face_detection_metrics['active_faces'][face_id]
-                face_info['last_seen'] = current_time
+            if face_id in self.face_detection_metrics['currently_present_faces']:
+                face_info = self.face_detection_metrics['currently_present_faces'][face_id]
+                face_info['last_seen'] = datetime.utcnow()
                 face_info['center'] = face_center
                 face_info['bbox'] = bbox
-                face_info['detection_count'] += 1
                 
         except Exception as e:
             logger.debug(f"Error updating existing face tracking: {str(e)}")
@@ -1354,13 +1545,11 @@ class StreamProcessor:
             # Generate new face ID
             face_id = str(uuid.uuid4())
             
-            self.face_detection_metrics['active_faces'][face_id] = {
+            self.face_detection_metrics['currently_present_faces'][face_id] = {
                 'center': face_center,
                 'bbox': bbox,
-                'first_seen': current_time,
-                'last_seen': current_time,
-                'detection_count': 1,
-                'user_id': None,
+                'first_seen': datetime.utcnow(),
+                'last_seen': datetime.utcnow(),
                 'user_name': "Unknown",
                 'confidence': 0.0
             }
@@ -1371,25 +1560,13 @@ class StreamProcessor:
             logger.debug(f"Error adding new face to tracking: {str(e)}")
             return str(uuid.uuid4())
     
+
+    
     def _cleanup_expired_faces(self):
-        """Clean up expired faces from tracking."""
-        try:
-            current_time = time.time()
-            expired_faces = []
-            
-            for face_id, face_info in self.face_detection_metrics['active_faces'].items():
-                if current_time - face_info['last_seen'] > self.face_detection_metrics['face_tracking_timeout']:
-                    expired_faces.append(face_id)
-            
-            # Remove expired faces
-            for face_id in expired_faces:
-                del self.face_detection_metrics['active_faces'][face_id]
-            
-            if expired_faces:
-                logger.debug(f"Camera {self.camera_id}: Cleaned up {len(expired_faces)} expired faces")
-                
-        except Exception as e:
-            logger.debug(f"Error cleaning up expired faces: {str(e)}")
+        """Clean up expired faces from tracking - no longer needed with new approach."""
+        # This method is no longer needed as we now track faces based on current presence
+        # Faces are automatically removed when they're no longer detected in the camera view
+        pass
 
 
 # Global stream manager instance for FastAPI

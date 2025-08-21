@@ -81,13 +81,48 @@ app.add_middleware(
 # Request logging middleware
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    """Log all requests and responses."""
+    """Log all requests and responses with enhanced formatting."""
     start_time = time.time()
     
-    # Log request
-    logger.info(
-        f"Request: {request.method} {request.url} - Client: {request.client.host if request.client else 'unknown'}"
-    )
+    # Get current timestamp in a cleaner format
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    
+    # Color codes for different request methods
+    method_colors = {
+        "GET": "\033[92m",      # Green
+        "POST": "\033[94m",     # Blue
+        "PUT": "\033[93m",      # Yellow
+        "DELETE": "\033[91m",   # Red
+        "PATCH": "\033[95m",    # Magenta
+        "OPTIONS": "\033[96m",  # Cyan
+        "HEAD": "\033[97m",     # White
+    }
+    
+    # Reset color code
+    reset_color = "\033[0m"
+    
+    # Get method color or default to white
+    method_color = method_colors.get(request.method, "\033[97m")
+    
+    # Additional colors for better visual appeal
+    timestamp_color = "\033[90m"  # Gray
+    url_color = "\033[97m"        # White
+    client_color = "\033[96m"     # Cyan
+    ua_color = "\033[95m"         # Magenta
+    
+    # Get client IP (check for forwarded IP first)
+    client_ip = request.headers.get("x-forwarded-for", request.client.host if request.client else 'unknown')
+    
+    # Get request size if available
+    content_length = request.headers.get("content-length")
+    request_size = f"({content_length} bytes)" if content_length else ""
+    
+    # Get user agent for additional context
+    user_agent = request.headers.get("user-agent", "")
+    user_agent_short = user_agent[:30] + "..." if len(user_agent) > 30 else user_agent
+    
+    # Log request with enhanced formatting
+    print(f"{timestamp_color}{timestamp}{reset_color} | {method_color}{request.method:>7}{reset_color} | {url_color}{request.url}{reset_color} {request_size} | {client_color}Client: {client_ip}{reset_color} | {ua_color}UA: {user_agent_short}{reset_color}")
     
     # Process request
     response = await call_next(request)
@@ -95,10 +130,34 @@ async def log_requests(request: Request, call_next):
     # Calculate processing time
     process_time = time.time() - start_time
     
-    # Log response
-    logger.info(
-        f"Response: {request.method} {request.url} - Status: {response.status_code} - Time: {process_time:.3f}s"
-    )
+    # Add visual separator for better readability
+    if process_time > 0.1:  # Only show separator for slower requests
+        print(f"{timestamp_color}{timestamp}{reset_color} | {'='*80}")
+    
+    # Get status color based on response code
+    status_colors = {
+        "2": "\033[92m",  # Green for 2xx
+        "3": "\033[93m",  # Yellow for 3xx
+        "4": "\033[91m",  # Red for 4xx
+        "5": "\033[91m",  # Red for 5xx
+    }
+    
+    status_color = status_colors.get(str(response.status_code)[0], "\033[97m")
+    
+    # Add performance warning for slow requests
+    if process_time > 1.0:
+        print(f"{timestamp_color}{timestamp}{reset_color} | ⚠️  SLOW REQUEST: {process_time:.3f}s")
+    
+    # Get response size if available
+    response_size = response.headers.get("content-length", "")
+    response_size_str = f"({response_size} bytes)" if response_size else ""
+    
+    # Get content type for additional context
+    content_type = response.headers.get("content-type", "")
+    content_type_short = content_type.split(";")[0] if content_type else ""
+    
+    # Log response with enhanced formatting
+    print(f"{timestamp_color}{timestamp}{reset_color} | {method_color}{request.method:>7}{reset_color} | {status_color}{response.status_code}{reset_color} | {url_color}{request.url}{reset_color} {response_size_str} | {ua_color}Type: {content_type_short}{reset_color} | {timestamp_color}Time: {process_time:.3f}s{reset_color}")
     
     # Add processing time header
     response.headers["X-Process-Time"] = str(process_time)

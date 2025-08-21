@@ -46,6 +46,9 @@ class Settings(BaseSettings):
     FACE_RECOGNITION_THRESHOLD: float = 0.5  # More lenient threshold (50%) for face recognition
     MAX_FACES_PER_IMAGE: int = 10
     
+    # Face Tracking (Duplicate Prevention)
+    FACE_DUPLICATE_PREVENTION_DISTANCE: int = 50  # Pixels distance to consider faces as the same person
+    
     # Logging
     LOG_LEVEL: str = "INFO"
     

@@ -59,9 +59,7 @@ class CameraService:
     async def get_camera(self, db: Session, camera_id: uuid.UUID) -> Optional[Camera]:
         """Get camera by ID."""
         try:
-            camera = db.query(Camera).filter(
-                and_(Camera.id == camera_id, Camera.is_deleted == False)
-            ).first()
+            camera = db.query(Camera).filter(Camera.id == camera_id).first()
             return camera
         except Exception as e:
             logger.error(f"Failed to get camera {camera_id}: {str(e)}")
@@ -76,7 +74,7 @@ class CameraService:
     ) -> Tuple[List[Camera], int]:
         """Get paginated list of cameras."""
         try:
-            query = db.query(Camera).filter(Camera.is_deleted == False)
+            query = db.query(Camera)
             
             if active_only:
                 query = query.filter(Camera.is_active == True)
@@ -119,20 +117,14 @@ class CameraService:
             return None
     
     async def delete_camera(self, db: Session, camera_id: uuid.UUID) -> bool:
-        """Soft delete camera."""
+        """Hard delete camera permanently."""
+        print(f"Deleting camera {camera_id}")
         try:
             camera = await self.get_camera(db, camera_id)
             if not camera:
                 return False
             
-            # Stop any active streams
-            await self.stop_camera_stream(camera_id)
-            
-            # Soft delete
-            camera.is_deleted = True
-            camera.deleted_at = datetime.utcnow()
-            camera.is_active = False
-            
+            db.delete(camera)
             db.commit()
             logger.info(f"Camera deleted successfully: {camera_id}")
             return True
